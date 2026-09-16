@@ -61,8 +61,8 @@
 
         <!-- Test components on GitLab (bild/u06-tests, bild/u06) -->
         <lutece.plugin-test-release-v7-v8.version>8.0.0-SNAPSHOT</lutece.plugin-test-release-v7-v8.version>
-        <lutece.releaser-test-redmine-component-gitlab.version>6.2.3-SNAPSHOT</lutece.releaser-test-redmine-component-gitlab.version>
-        <lutece.plugin-testreleasegitlab.version>2.2.5-SNAPSHOT</lutece.plugin-testreleasegitlab.version>
+        <lutece.releaser-test-redmine-component-gitlab.version>1.0.9-SNAPSHOT</lutece.releaser-test-redmine-component-gitlab.version>
+        <lutece.plugin-testreleasegitlab.version>2.2.8-SNAPSHOT</lutece.plugin-testreleasegitlab.version>
     </properties>
 
     <build>
