@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>fr.paris.lutece.starters</groupId>
+        <artifactId>release-test-lutece-parent</artifactId>
+        <version>7.2.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>release-test-forms-starter</artifactId>
+    <version>${revision}</version>
+    <name>Release test - Forms Starter</name>
+    <description>Test starter : GitHub test components</description>
+
+    <properties>
+        <!-- Project version alias. Maven only interpolates revision, sha1 and
+             changelist inside a project version; any other property raises
+             "version contains an expression but should be a constant". The value
+             itself stays in the root pom, so modules can still diverge. -->
+        <revision>${lutece.release-test-forms-starter.version}</revision>
+        <maven.deploy.skip>${forms.deploy.skip}</maven.deploy.skip>
+        <componentName>release-test-forms-starter</componentName>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>fr.paris.lutece</groupId>
+            <artifactId>lutece-core</artifactId>
+            <version>${lutece.core.version}</version>
+            <type>lutece-core</type>
+        </dependency>
+        <dependency>
+            <groupId>fr.paris.lutece.plugins</groupId>
+            <artifactId>plugin-releaser-test</artifactId>
+            <version>${lutece.plugin-releaser-test.version}</version>
+            <type>lutece-plugin</type>
+        </dependency>
+        <dependency>
+            <groupId>fr.paris.lutece.plugins</groupId>
+            <artifactId>releaser-test-redmine-component</artifactId>
+            <version>${lutece.releaser-test-redmine-component.version}</version>
+            <type>lutece-plugin</type>
+        </dependency>
+    </dependencies>
+</project>

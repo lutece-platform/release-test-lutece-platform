@@ -1,0 +1,106 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <artifactId>lutece-global-pom</artifactId>
+        <groupId>fr.paris.lutece.tools</groupId>
+        <version>7.0.8</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>fr.paris.lutece.starters</groupId>
+    <artifactId>release-test-lutece-parent</artifactId>
+    <version>7.2.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+    <name>Release test - Lutece platform parent</name>
+    <description>Test fixture of the releaser : a copy of the lutece-platform monorepo (same structure, same pipeline) whose starters aggregate test components only</description>
+
+    <repositories>
+        <repository>
+            <id>lutece</id>
+            <name>luteceRepository</name>
+            <url>https://dev.lutece.paris.fr/maven_repository</url>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
+
+    <modules>
+        <module>release-test-lutece-bom</module>
+        <module>release-test-forms-starter</module>
+        <module>release-test-appointment-starter</module>
+        <module>release-test-editorial-starter</module>
+        <module>release-test-lutece-starter</module>
+    </modules>
+
+    <properties>
+        <parent.deploy.skip>true</parent.deploy.skip>
+        <bom.deploy.skip>false</bom.deploy.skip>
+        <forms.deploy.skip>false</forms.deploy.skip>
+        <appointment.deploy.skip>false</appointment.deploy.skip>
+        <editorial.deploy.skip>false</editorial.deploy.skip>
+        <lutece.deploy.skip>false</lutece.deploy.skip>
+
+        <maven.deploy.skip>${parent.deploy.skip}</maven.deploy.skip>
+
+        <!-- LUTECE PROFILES VERSION — each starter/BOM has its own version for independent releases -->
+        <lutece.release-test-forms-starter.version>7.2.0-SNAPSHOT</lutece.release-test-forms-starter.version>
+        <lutece.release-test-appointment-starter.version>7.2.0-SNAPSHOT</lutece.release-test-appointment-starter.version>
+        <lutece.release-test-editorial-starter.version>7.2.0-SNAPSHOT</lutece.release-test-editorial-starter.version>
+        <lutece.release-test-lutece-starter.version>7.2.0-SNAPSHOT</lutece.release-test-lutece-starter.version>
+        <lutece.release-test-lutece-bom.version>7.2.0-SNAPSHOT</lutece.release-test-lutece-bom.version>
+
+        <!-- Lutece core (real, released : exercises the "core" -> "lutece-core" alias of the releaser) -->
+        <lutece.core.version>7.1.9</lutece.core.version>
+
+        <!-- Test components on GitHub (lutece-platform) -->
+        <lutece.plugin-releaser-test.version>6.2.3-SNAPSHOT</lutece.plugin-releaser-test.version>
+        <lutece.releaser-test-redmine-component.version>1.0.13-SNAPSHOT</lutece.releaser-test-redmine-component.version>
+        <lutece.releaser-test-redmine-component-buttom.version>1.0.2-SNAPSHOT</lutece.releaser-test-redmine-component-buttom.version>
+        <lutece.module-testrelease.version>0.1.12-SNAPSHOT</lutece.module-testrelease.version>
+
+        <!-- Test components on GitLab (bild/u06-tests, bild/u06) -->
+        <lutece.plugin-test-release-v7-v8.version>1.0.1-SNAPSHOT</lutece.plugin-test-release-v7-v8.version>
+        <lutece.releaser-test-redmine-component-gitlab.version>1.0.9-SNAPSHOT</lutece.releaser-test-redmine-component-gitlab.version>
+        <lutece.plugin-testreleasegitlab.version>2.2.8-SNAPSHOT</lutece.plugin-testreleasegitlab.version>
+    </properties>
+
+    <build>
+        <defaultGoal>package</defaultGoal>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <version>1.7.3</version>
+                <configuration>
+                    <updatePomFile>true</updatePomFile>
+                    <flattenMode>clean</flattenMode>
+                    <flattenDependencyMode>direct</flattenDependencyMode>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>flatten</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>flatten</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>flatten.clean</id>
+                        <phase>clean</phase>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <scm>
+        <connection>scm:git:https://github.com/lutece-platform/release-test-lutece-platform</connection>
+        <developerConnection>scm:git:https://github.com/lutece-platform/release-test-lutece-platform</developerConnection>
+        <url>https://github.com/lutece-platform/release-test-lutece-platform</url>
+        <tag>HEAD</tag>
+    </scm>
+</project>

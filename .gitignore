@@ -1,0 +1,43 @@
+# Java #
+*.class
+
+# Package Files #
+*.jar
+*.war
+
+# IDEA #
+*.iml
+.idea
+
+# Emacs #
+*~
+
+# Eclipse #
+.project
+.metadata
+.classpath
+.settings/
+
+# Netbeans #
+nbproject/private/
+
+# Maven files #
+target/
+*/target
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+
+# Flatten Maven Plugin #
+.flattened-pom.xml
+*/.flattened-pom.xml
+
+# Vim swap files #
+*.swp
+*.swo
+
+# Maven effective POM #
+effective-pom.xml
+*/effective-pom.xml
