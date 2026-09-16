@@ -1,0 +1,223 @@
+/**
+ * Lutece Platform — Release Pipeline (copy for the releaser test platform release-test-lutece-platform)
+ *
+ * Scope: the release-test-lutece-platform monorepo only.
+ *   POM parent → specialized starters → release-test-lutece-starter → BOM
+ *
+ * Plugin releases are NOT handled here. Plugin versions are maintained by hand
+ * in the root pom.xml and must already be release versions: the pipeline marks
+ * the build UNSTABLE if any lutece.*.version property is still a SNAPSHOT.
+ *
+ * Works on both Lutece lines. The line is detected from the lutece-global-pom
+ * version inherited by the root pom.xml, and the JDK used to build comes from
+ * that global-pom's <targetJdk> property:
+ *   V7 (global-pom 7.0.x, branch develop_core7) -> targetJdk 11 -> JDK 11
+ *   V8 (global-pom 8.0.x, branch develop)       -> targetJdk 17 -> JDK 17
+ *
+ * Release types: stable (8.0.0), beta (8.0.0-beta-01), RC (8.0.0-RC-01).
+ *
+ * Tag naming:
+ *   RELEASE_TARGET = 'all'   -> v8.0.0-beta-01               (platform)
+ *   RELEASE_TARGET = starter -> release-test-forms-starter-8.0.0-beta-01  (module)
+ *
+ * DRY_RUN is true by default to prevent accidental releases.
+ *
+ * Stage logic lives in release-helpers.groovy (loaded via load()) to stay
+ * under the 64 KB JVM bytecode-per-method limit imposed by Jenkins CPS.
+ */
+
+// Declared at script scope so that assigning it in the Initialize stage does
+// not create a WorkflowScript field ("Did you forget the `def` keyword?").
+def helpers
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 4, unit: 'HOURS')
+        disableConcurrentBuilds()
+    }
+
+    // Bootstrap toolchain only: this JDK runs the version/tag/Maven-evaluation
+    // steps. The JDK that actually compiles and deploys each artifact is picked
+    // at runtime from the POM's targetJdk (see helpers.withJdk / JDK_TOOL_MAP).
+    tools {
+        maven 'Maven 3.8.5'
+        jdk 'temurin-17-jdk'
+    }
+
+    parameters {
+        choice(
+            name: 'RELEASE_TARGET',
+            choices: ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter', 'release-test-lutece-starter', 'release-test-lutece-bom', 'all'],
+            description: 'Cible de la release. "all" = starters spécialisés + release-test-lutece-starter + BOM.'
+        )
+        string(
+            name: 'RELEASE_VERSION',
+            defaultValue: '',
+            description: 'Version release (ex: 8.0.0). Vide = auto-calculée depuis la version SNAPSHOT courante.'
+        )
+        string(
+            name: 'NEXT_SNAPSHOT_VERSION',
+            defaultValue: '',
+            description: 'Prochaine version SNAPSHOT (ex: 8.0.1-SNAPSHOT). Vide = auto-calculée (patch+1).'
+        )
+        booleanParam(
+            name: 'DRY_RUN',
+            defaultValue: true,
+            description: 'Mode simulation : aucun push, deploy ou merge ne sera effectué.'
+        )
+        booleanParam(
+            name: 'ALLOW_SNAPSHOT_DEPENDENCIES',
+            defaultValue: false,
+            description: 'Publier meme si des plugins sont encore en SNAPSHOT dans le pom.xml. Par defaut le build echoue au stage Validate Release Readiness, avant tout tag et tout deploy. A n\'activer qu\'en connaissance de cause : les artefacts publies dependraient de versions mouvantes.'
+        )
+        choice(
+            name: 'PRERELEASE_TYPE',
+            choices: ['none', 'beta', 'rc'],
+            description: 'Type de release.\nnone = release stable (8.0.0).\nbeta = pre-release beta (8.0.0-beta-01).\nrc = release candidate (8.0.0-RC-01).\nbeta et rc ne mergent pas sur master et restaurent la version SNAPSHOT apres le deploy.'
+        )
+        string(
+            name: 'PRERELEASE_NUMBER',
+            defaultValue: '1',
+            description: 'Numero de la pre-release (1, 2, 3...), complete sur 2 chiffres : 1 -> beta-01. Ignore si PRERELEASE_TYPE = none.'
+        )
+        choice(
+            name: 'LUTECE_MAJOR',
+            choices: ['auto', '8', '7'],
+            description: 'Ligne Lutece a releaser.\nauto = detectee depuis la version de lutece-global-pom heritee par le pom.xml courant (7.0.x -> V7, 8.0.x -> V8).\nDetermine le JDK (via targetJdk) et l\'ordre de recherche des branches de dev des plugins.'
+        )
+        string(
+            name: 'MONOREPO_BRANCH',
+            defaultValue: '',
+            description: 'Branche de release de ce depot. Vide = branche courante si elle est connue (develop, develop_core7, develop_core8), sinon develop pour la V8 et develop_core7 pour la V7.'
+        )
+        string(
+            name: 'JDK_TOOL_MAP',
+            defaultValue: '',
+            description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Vide = convention temurin-{version}-jdk.'
+        )
+        string(
+            name: 'GITHUB_CREDENTIAL_ID',
+            defaultValue: 'github-token',
+            description: 'ID du credential Jenkins contenant le token GitHub (type: Secret text).'
+        )
+        string(
+            name: 'MAVEN_SETTINGS_ID',
+            defaultValue: 'maven_settings_default',
+            description: 'ID du Config File Provider pour le settings.xml Maven.'
+        )
+        string(
+            name: 'GIT_USER_NAME',
+            defaultValue: 'ryahiaoui',
+            description: 'Nom utilisateur pour les commits git de la release.'
+        )
+        string(
+            name: 'GIT_USER_EMAIL',
+            defaultValue: 'rafik.yahiaoui@paris.fr',
+            description: 'Email utilisateur pour les commits git de la release.'
+        )
+    }
+
+    environment {
+        RELEASE_REPORT = "${WORKSPACE}/release-report.txt"
+    }
+
+    stages {
+
+        stage('Initialize') {
+            steps {
+                script {
+                    helpers = load('release-helpers.groovy')
+                    helpers.stageInitialize()
+                }
+            }
+        }
+
+        stage('Update POM Parent Versions') {
+            steps {
+                script { helpers.stageUpdatePomVersions() }
+            }
+        }
+
+        stage('Validate Release Readiness') {
+            steps {
+                script { helpers.stageValidateReleaseReadiness() }
+            }
+        }
+
+        stage('Tag Release') {
+            steps {
+                script { helpers.stageTagRelease() }
+            }
+        }
+
+        stage('Release Specialized Starters') {
+            when {
+                expression {
+                    def starters = env.STARTERS_TO_RELEASE?.split(',')?.collect { it.trim() }?.findAll { it } ?: []
+                    return starters.any { it in ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter'] }
+                }
+            }
+            steps {
+                script { helpers.stageReleaseSpecializedStarters() }
+            }
+        }
+
+        stage('Release release-test-lutece-starter') {
+            when {
+                expression {
+                    def starters = env.STARTERS_TO_RELEASE?.split(',')?.collect { it.trim() }?.findAll { it } ?: []
+                    return starters.contains('release-test-lutece-starter')
+                }
+            }
+            steps {
+                script { helpers.stageReleaseLuteceStarter() }
+            }
+        }
+
+        stage('Release release-test-lutece-bom') {
+            when {
+                expression {
+                    def starters = env.STARTERS_TO_RELEASE?.split(',')?.collect { it.trim() }?.findAll { it } ?: []
+                    return starters.contains('release-test-lutece-bom') || params.RELEASE_TARGET == 'all'
+                }
+            }
+            steps {
+                script { helpers.stageReleaseBom() }
+            }
+        }
+
+        stage('Promote to master') {
+            when {
+                expression { return params.RELEASE_TARGET == 'all' }
+            }
+            steps {
+                script { helpers.stagePromoteToMaster() }
+            }
+        }
+
+        stage('Prepare Next SNAPSHOT') {
+            steps {
+                script { helpers.stagePrepareNextSnapshot() }
+            }
+        }
+
+        stage('Release Report') {
+            steps {
+                script { helpers.stageReleaseReport() }
+                archiveArtifacts artifacts: 'release-report.txt', fingerprint: true
+            }
+        }
+    }
+
+    post {
+        success {
+            script { helpers.postSuccess() }
+        }
+        failure {
+            script { helpers.postFailure() }
+        }
+    }
+}

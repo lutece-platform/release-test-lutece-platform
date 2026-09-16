@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>fr.paris.lutece.starters</groupId>
+        <artifactId>release-test-lutece-parent</artifactId>
+        <version>8.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>release-test-lutece-starter</artifactId>
+    <version>${revision}</version>
+    <name>Release test - Lutece Platform starter</name>
+    <description>Test starter aggregating the three specialized test starters</description>
+
+    <properties>
+        <!-- Project version alias. Maven only interpolates revision, sha1 and
+             changelist inside a project version; any other property raises
+             "version contains an expression but should be a constant". The value
+             itself stays in the root pom, so modules can still diverge. -->
+        <revision>${lutece.release-test-lutece-starter.version}</revision>
+        <maven.deploy.skip>${lutece.deploy.skip}</maven.deploy.skip>
+        <componentName>release-test-lutece-starter</componentName>
+    </properties>
+
+    <dependencies>
+        <!-- ================================================== -->
+        <!-- Starters                                           -->
+        <!-- ================================================== -->
+        <dependency>
+            <groupId>fr.paris.lutece.starters</groupId>
+            <artifactId>release-test-forms-starter</artifactId>
+            <version>${lutece.release-test-forms-starter.version}</version>
+            <type>jar</type>
+        </dependency>
+        <dependency>
+            <groupId>fr.paris.lutece.starters</groupId>
+            <artifactId>release-test-appointment-starter</artifactId>
+            <version>${lutece.release-test-appointment-starter.version}</version>
+            <type>jar</type>
+        </dependency>
+        <dependency>
+            <groupId>fr.paris.lutece.starters</groupId>
+            <artifactId>release-test-editorial-starter</artifactId>
+            <version>${lutece.release-test-editorial-starter.version}</version>
+            <type>jar</type>
+        </dependency>
+    </dependencies>
+</project>
