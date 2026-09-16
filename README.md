@@ -33,19 +33,19 @@ toute collision), POM racine `release-test-lutece-parent`, parent `lutece-global
 | `plugin-testreleasegitlab` | dev.lutece.paris.fr/gitlab/bild/u06/plugin-releaser-test-gitlab | editorial |
 
 Les properties `lutece.<artifactId>.version` du POM racine portent les snapshots courants de chaque composant au
-16/09/2026 (branche `develop`, ou `develop_core7` pour `plugin-test-release-v7-v8` sur la ligne 7). Elles évoluent
+16/09/2026 (branche `develop`, ou `develop_core7` pour `plugin-test-release-v7-v8` en core 7). Elles évoluent
 à chaque release de test. `lutece.core.version` référence le vrai core et exerce l'alias `core` → `lutece-core`
 du releaser.
 
 ## Branches
 
-| Branche | Ligne | Parent global-pom | Versions des modules | Core |
+| Branche | Version du core | Parent global-pom | Versions des modules | `lutece.core.version` |
 |---|---|---|---|---|
-| `develop` | Lutece 8 | 8.0.1 | 8.0.0-SNAPSHOT | 8.0.1 |
-| `develop_core7` | Lutece 7 | 7.0.8 | 7.2.0-SNAPSHOT | 7.1.9 |
+| `develop` | core 8 | 8.0.1 | 8.0.0-SNAPSHOT | 8.0.1 |
+| `develop_core7` | core 7 | 7.0.8 | 7.2.0-SNAPSHOT | 7.1.9 |
 
 Seul `plugin-test-release-v7-v8` possède une branche `develop_core7` ; les autres composants de test n'ont qu'une
-branche `develop`, que le releaser retient par repli sur la ligne 7 (`develop_core7`, puis `develop7.x`, puis `develop`).
+branche `develop`, que le releaser retient par repli en core 7 (`develop_core7`, puis `develop7.x`, puis `develop`).
 
 ## Pipeline
 
