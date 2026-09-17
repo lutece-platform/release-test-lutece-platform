@@ -47,11 +47,15 @@ du releaser.
 Seul `plugin-test-release-v7-v8` possède une branche `develop_core7` ; les autres composants de test n'ont qu'une
 branche `develop`, que le releaser retient par repli en core 7 (`develop_core7`, puis `develop7.x`, puis `develop`).
 
-## Pipeline
+## Pipelines
 
-`Jenkinsfile-release` et `release-helpers.groovy` sont ceux de lutece-platform, avec les cinq noms de modules
-remplacés par les noms de test et l'URL de push pointée sur ce dépôt. Le job Jenkins qui l'exécute doit
-correspondre à la property `releaser.platform.jenkins.platformJob` du releaser de test.
+- `Jenkinsfile-release` et `release-helpers.groovy` sont ceux de lutece-platform, avec les cinq noms de modules
+  remplacés par les noms de test et l'URL de push pointée sur ce dépôt. Le job Jenkins qui l'exécute doit
+  correspondre à la property `releaser.platform.jenkins.platformJob` du releaser de test (étape 5).
+- `Jenkinsfile-platform-step` et `platform-step-helpers.groovy` : le pipeline **générique d'étape** piloté par le
+  releaser (étapes 1 à 4), mis au point ici avant d'être copié dans lutece-platform. Paramètre `RELEASE_PLAN` (JSON
+  du plan), rapport `step-report.json` archivé après chaque composant releasé. Le job Jenkins qui l'exécute doit
+  correspondre à la property `releaser.platform.jenkins.stepJob`.
 
 ## Brancher le releaser dessus
 

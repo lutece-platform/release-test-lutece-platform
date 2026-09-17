@@ -1,0 +1,152 @@
+/**
+ * Lutece Platform — Step Pipeline (generic, driven by the releaser)
+ *
+ * Executes ONE step of a platform release campaign prepared in the releaser
+ * (global-pom, site-pom, core or platform plugins) : releases the components
+ * of the step in the order received, then updates the POM of the aggregate
+ * and releases it (the lutece-platform monorepo itself is NOT released here,
+ * its starters and BOM are released by Jenkinsfile-release at the last step).
+ *
+ * Input : the RELEASE_PLAN parameter, a JSON document built by the releaser :
+ *   { campaignId, campaignName, step, stepCode, releaseType, coreMajor, dryRun,
+ *     components : [ { groupId, artifactId, type, scmUrl, branch, masterBranch,
+ *                      currentVersion, targetVersion, nextSnapshotVersion } ],
+ *     aggregate  : { ...same fields..., parentVersion,
+ *                    versionUpdates : { properties : {name : version}, dependencies : {"groupId:artifactId" : version} } } }
+ *
+ * Output : step-report.json, archived after EVERY released component so that a
+ * failed build still tells the releaser what was published :
+ *   { releasedVersions : {"groupId:artifactId" : version}, aggregateVersion, report }
+ *
+ * Rules :
+ *  - fail-fast : the first failing component stops the build, the aggregate is
+ *    never touched before all its components are released ;
+ *  - per resource, everything runs locally first (tests, version, commit, tag)
+ *    and is published in one go (push, Nexus deploy, master merge, next snapshot) ;
+ *  - dryRun = true : nothing is pushed, deployed or merged.
+ *
+ * Stage logic lives in platform-step-helpers.groovy (loaded via load()) to stay
+ * under the 64 KB JVM bytecode-per-method limit imposed by Jenkins CPS.
+ */
+
+def helpers
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timeout(time: 4, unit: 'HOURS')
+        disableConcurrentBuilds()
+    }
+
+    // Bootstrap toolchain only : each resource is built with the JDK matching
+    // its own POM (targetJdk), see helpers.withJdk / JDK_TOOL_MAP.
+    tools {
+        maven 'Maven 3.8.5'
+        jdk 'temurin-17-jdk'
+    }
+
+    parameters {
+        text(
+            name: 'RELEASE_PLAN',
+            defaultValue: '',
+            description: 'Plan JSON de l\'etape, construit et envoye par le releaser (voir l\'en-tete du Jenkinsfile). Ne pas remplir a la main hors test.'
+        )
+        booleanParam(
+            name: 'RUN_TESTS',
+            defaultValue: true,
+            description: 'Lancer les tests (lutece:exploded antrun:run -Dlutece-test-hsql test) avant la release des composants de packaging lutece-plugin ou lutece-core.'
+        )
+        string(
+            name: 'GITHUB_CREDENTIAL_ID',
+            defaultValue: 'github-token',
+            description: 'ID du credential Jenkins contenant le token GitHub (type: Secret text).'
+        )
+        string(
+            name: 'GITLAB_CREDENTIAL_ID',
+            defaultValue: 'gitlab-token',
+            description: 'ID du credential Jenkins contenant le token GitLab dev.lutece.paris.fr (type: Secret text, scope write_repository).'
+        )
+        string(
+            name: 'MAVEN_SETTINGS_ID',
+            defaultValue: 'maven_settings_default',
+            description: 'ID du Config File Provider pour le settings.xml Maven (compte de deploiement Nexus).'
+        )
+        string(
+            name: 'JDK_TOOL_MAP',
+            defaultValue: '',
+            description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Vide = convention temurin-{version}-jdk.'
+        )
+        string(
+            name: 'GIT_USER_NAME',
+            defaultValue: 'releaser',
+            description: 'Nom utilisateur pour les commits git de la release.'
+        )
+        string(
+            name: 'GIT_USER_EMAIL',
+            defaultValue: 'releaser@paris.fr',
+            description: 'Email utilisateur pour les commits git de la release.'
+        )
+    }
+
+    environment {
+        STEP_REPORT = "${WORKSPACE}/step-report.json"
+        WORK_DIR = "${WORKSPACE}/work"
+    }
+
+    stages {
+
+        stage('Initialize') {
+            steps {
+                script {
+                    helpers = load('platform-step-helpers.groovy')
+                    helpers.stageInitialize()
+                }
+            }
+        }
+
+        stage('Release components') {
+            steps {
+                script { helpers.stageReleaseComponents() }
+            }
+        }
+
+        stage('Update aggregate POM') {
+            when {
+                expression { return helpers.hasAggregate() }
+            }
+            steps {
+                script { helpers.stageUpdateAggregate() }
+            }
+        }
+
+        stage('Release aggregate') {
+            when {
+                expression { return helpers.isAggregateReleased() }
+            }
+            steps {
+                script { helpers.stageReleaseAggregate() }
+            }
+        }
+
+        stage('Report') {
+            steps {
+                script { helpers.stageReport() }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'step-report.json', allowEmptyArchive: true, fingerprint: true
+        }
+        failure {
+            script {
+                if (helpers != null) {
+                    helpers.postFailure()
+                }
+            }
+        }
+    }
+}
