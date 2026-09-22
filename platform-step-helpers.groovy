@@ -135,9 +135,9 @@ def normalizeJdkMajor(String raw) {
 /**
  * Resolves the effective targetJdk of the POM in a directory, falling back on the core version of the campaign (core 7 -> JDK 11, else 17).
  */
-def detectTargetJdk(String dir) {
+def detectTargetJdk(String workDir) {
     def raw = null
-    dir(dir) {
+    dir(workDir) {
         try {
             raw = sh(
                 script: "mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=targetJdk -DforceStdout 2>/dev/null | tail -1",
@@ -197,8 +197,8 @@ def withJdk(String major, Closure body) {
  * Sets the version of a resource everywhere the releaser does : the POM (versions:set), the plugin descriptors
  * webapp/WEB-INF/plugins/*.xml, and for lutece-core the descriptor webapp/WEB-INF/conf/core.xml and AppInfo.java.
  */
-def setResourceVersion(String dir, resource, String version) {
-    dir(dir) {
+def setResourceVersion(String workDir, resource, String version) {
+    dir(workDir) {
         sh "mvn -s ${env.MAVEN_SETTINGS_XML} -q versions:set -DnewVersion=${version} -DgenerateBackupPoms=false"
         sh """
             for xmlFile in webapp/WEB-INF/plugins/*.xml; do
@@ -230,35 +230,35 @@ def mustRunTests(resource) {
  * Clones a resource on its release branch into the work directory and returns the directory.
  */
 def cloneResource(resource) {
-    def dir = "${env.WORK_DIR}/${resource.artifactId}"
-    sh "rm -rf '${dir}'"
+    def workDir = "${env.WORK_DIR}/${resource.artifactId}".toString()
+    sh "rm -rf '${workDir}'"
     withRepositoryUrl(resource.scmUrl) { authUrl ->
-        sh "git clone --branch '${resource.branch}' '${authUrl}' '${dir}'"
+        sh "git clone --branch '${resource.branch}' '${authUrl}' '${workDir}'"
     }
-    dir(dir) {
+    dir(workDir) {
         sh "git config user.email '${params.GIT_USER_EMAIL}'"
         sh "git config user.name '${params.GIT_USER_NAME}'"
     }
-    return dir
+    return workDir
 }
 
 /**
  * Releases a resource cloned in a directory, following RELEASE.md : tests, release version, commit and tag (all local), then in one go
  * push, Nexus deploy, master merge (stable only) and next snapshot. In dry run the local part runs and the publication is only logged.
  */
-def releaseResource(String dir, resource) {
+def releaseResource(String workDir, resource) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
     echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}) ==="
 
-    dir(dir) {
+    dir(workDir) {
         if (mustRunTests(resource)) {
             echo "Running the tests of ${resource.artifactId}"
             sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q"
         }
     }
 
-    setResourceVersion(dir, resource, resource.targetVersion)
-    dir(dir) {
+    setResourceVersion(workDir, resource, resource.targetVersion)
+    dir(workDir) {
         sh """
             git add -A
             git diff --cached --quiet && echo 'Version already at ${resource.targetVersion} — nothing to commit' || git commit -m "release: ${tag}"
@@ -277,18 +277,18 @@ def releaseResource(String dir, resource) {
     }
 
     withRepositoryUrl(resource.scmUrl) { authUrl ->
-        dir(dir) {
+        dir(workDir) {
             sh "git push '${authUrl}' '${resource.branch}'"
             sh "git push '${authUrl}' 'refs/tags/${tag}'"
         }
     }
 
-    dir(dir) {
+    dir(workDir) {
         sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true"
     }
 
     withRepositoryUrl(resource.scmUrl) { authUrl ->
-        dir(dir) {
+        dir(workDir) {
             if (resource.masterBranch) {
                 sh """
                     git fetch '${authUrl}' '${resource.masterBranch}:${resource.masterBranch}' || git branch '${resource.masterBranch}' 'refs/remotes/origin/${resource.masterBranch}'
@@ -302,9 +302,9 @@ def releaseResource(String dir, resource) {
     }
 
     if (resource.nextSnapshotVersion) {
-        setResourceVersion(dir, resource, resource.nextSnapshotVersion)
+        setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
         withRepositoryUrl(resource.scmUrl) { authUrl ->
-            dir(dir) {
+            dir(workDir) {
                 sh """
                     git add -A
                     git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
@@ -326,8 +326,8 @@ def releaseResource(String dir, resource) {
  * (property name -> value) and the dependency declarations ("groupId:artifactId" -> version, the <version> tag right after the
  * <artifactId> tag). Nothing is guessed here : a version held by a property comes in "properties", never in "dependencies".
  */
-def applyVersionUpdates(String dir, aggregate) {
-    dir(dir) {
+def applyVersionUpdates(String workDir, aggregate) {
+    dir(workDir) {
         if (aggregate.parentVersion) {
             sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${aggregate.parentVersion}</version>|' pom.xml"
             echo "Parent version -> ${aggregate.parentVersion}"
@@ -393,9 +393,9 @@ def stageReleaseComponents() {
         return
     }
     components.each { component ->
-        def dir = cloneResource(component)
-        withJdk(detectTargetJdk(dir)) {
-            releaseResource(dir, component)
+        def workDir = cloneResource(component)
+        withJdk(detectTargetJdk(workDir)) {
+            releaseResource(workDir, component)
         }
         recordReleased(component)
     }
@@ -407,11 +407,11 @@ def stageReleaseComponents() {
  */
 def stageUpdateAggregate() {
     def aggregate = plan().aggregate
-    def dir = cloneResource(aggregate)
-    env.AGGREGATE_DIR = dir
-    applyVersionUpdates(dir, aggregate)
+    def workDir = cloneResource(aggregate)
+    env.AGGREGATE_DIR = workDir
+    applyVersionUpdates(workDir, aggregate)
 
-    dir(dir) {
+    dir(workDir) {
         sh """
             git add -A
             git diff --cached --quiet && echo 'Aggregate POM already up to date — nothing to commit' || git commit -m "chore: update versions for the release of ${aggregate.artifactId} ${aggregate.targetVersion}"
@@ -425,7 +425,7 @@ def stageUpdateAggregate() {
         echo "[DRY-RUN] Would push the updated POM of ${aggregate.artifactId} on ${aggregate.branch}"
     } else {
         withRepositoryUrl(aggregate.scmUrl) { authUrl ->
-            dir(dir) {
+            dir(workDir) {
                 sh "git push '${authUrl}' '${aggregate.branch}'"
             }
         }
@@ -438,9 +438,9 @@ def stageUpdateAggregate() {
  */
 def stageReleaseAggregate() {
     def aggregate = plan().aggregate
-    def dir = env.AGGREGATE_DIR
-    withJdk(detectTargetJdk(dir)) {
-        releaseResource(dir, aggregate)
+    def workDir = env.AGGREGATE_DIR
+    withJdk(detectTargetJdk(workDir)) {
+        releaseResource(workDir, aggregate)
     }
     def report = readReport()
     report.aggregateVersion = aggregate.targetVersion
