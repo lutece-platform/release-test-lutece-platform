@@ -12,10 +12,11 @@
 // ========================================================================
 
 /**
- * Returns the plan sent by the releaser, parsed once in stageInitialize.
+ * Returns the plan sent by the releaser, parsed once in stageInitialize. Plain objects (returnPojo) so that a JSON null is a real null,
+ * not a JSONNull instance that Groovy would evaluate as true.
  */
 def plan() {
-    return readJSON(text: env.PLAN_JSON)
+    return readJSON(text: env.PLAN_JSON, returnPojo: true)
 }
 
 /**
@@ -51,7 +52,7 @@ def isAggregateReleased() {
  * Reads the current report.
  */
 def readReport() {
-    return readJSON(file: env.STEP_REPORT)
+    return readJSON(file: env.STEP_REPORT, returnPojo: true)
 }
 
 /**
@@ -356,7 +357,7 @@ def stageInitialize() {
     if (!params.RELEASE_PLAN?.trim()) {
         error('RELEASE_PLAN is empty : this job is meant to be triggered by the releaser with the plan of a step.')
     }
-    def thePlan = readJSON(text: params.RELEASE_PLAN)
+    def thePlan = readJSON(text: params.RELEASE_PLAN, returnPojo: true)
     if (!thePlan.stepCode || thePlan.components == null) {
         error('RELEASE_PLAN is not a step plan : stepCode and components are required.')
     }
