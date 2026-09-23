@@ -96,21 +96,23 @@ def credentialIdFor(String scmUrl) {
 
 /**
  * Authenticated clone/push URL : GitHub takes the token as user, GitLab takes it as the password of the oauth2 user.
+ * The token is NOT in the returned string : it holds a literal $GIT_TOKEN reference that only the shell expands, so the secret never
+ * goes through Groovy string interpolation. Callers must put the URL between double quotes in the shell command.
  */
-def authenticatedUrl(String scmUrl, String token) {
+def authenticatedUrl(String scmUrl) {
     def url = scmUrl.replaceFirst('^scm:git:', '')
     if (url.contains('github.com')) {
-        return url.replaceFirst('^https://', "https://${token}@")
+        return url.replaceFirst('^https://', 'https://\\$GIT_TOKEN@')
     }
-    return url.replaceFirst('^https://', "https://oauth2:${token}@")
+    return url.replaceFirst('^https://', 'https://oauth2:\\$GIT_TOKEN@')
 }
 
 /**
- * Runs the closure with the authenticated URL of a repository (the token is masked in the logs by withCredentials).
+ * Runs the closure with the authenticated URL of a repository, the GIT_TOKEN shell variable being bound by withCredentials (masked in the logs).
  */
 def withRepositoryUrl(String scmUrl, Closure body) {
     withCredentials([string(credentialsId: credentialIdFor(scmUrl), variable: 'GIT_TOKEN')]) {
-        body(authenticatedUrl(scmUrl, env.GIT_TOKEN))
+        body(authenticatedUrl(scmUrl))
     }
 }
 
@@ -234,7 +236,7 @@ def cloneResource(resource) {
     def workDir = "${env.WORK_DIR}/${resource.artifactId}".toString()
     sh "rm -rf '${workDir}'"
     withRepositoryUrl(resource.scmUrl) { authUrl ->
-        sh "git clone --branch '${resource.branch}' '${authUrl}' '${workDir}'"
+        sh "git clone --branch '${resource.branch}' \"${authUrl}\" '${workDir}'"
     }
     dir(workDir) {
         sh "git config user.email '${params.GIT_USER_EMAIL}'"
@@ -279,8 +281,8 @@ def releaseResource(String workDir, resource) {
 
     withRepositoryUrl(resource.scmUrl) { authUrl ->
         dir(workDir) {
-            sh "git push '${authUrl}' '${resource.branch}'"
-            sh "git push '${authUrl}' 'refs/tags/${tag}'"
+            sh "git push \"${authUrl}\" '${resource.branch}'"
+            sh "git push \"${authUrl}\" 'refs/tags/${tag}'"
         }
     }
 
@@ -292,10 +294,10 @@ def releaseResource(String workDir, resource) {
         dir(workDir) {
             if (resource.masterBranch) {
                 sh """
-                    git fetch '${authUrl}' '${resource.masterBranch}:${resource.masterBranch}' || git branch '${resource.masterBranch}' 'refs/remotes/origin/${resource.masterBranch}'
+                    git fetch "${authUrl}" '${resource.masterBranch}:${resource.masterBranch}' || git branch '${resource.masterBranch}' 'refs/remotes/origin/${resource.masterBranch}'
                     git checkout '${resource.masterBranch}'
                     git merge '${resource.branch}' -m "Merge ${resource.branch} for release ${tag}"
-                    git push '${authUrl}' '${resource.masterBranch}'
+                    git push "${authUrl}" '${resource.masterBranch}'
                     git checkout '${resource.branch}'
                 """
             }
@@ -309,7 +311,7 @@ def releaseResource(String workDir, resource) {
                 sh """
                     git add -A
                     git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
-                    git push '${authUrl}' '${resource.branch}'
+                    git push "${authUrl}" '${resource.branch}'
                 """
             }
         }
@@ -427,7 +429,7 @@ def stageUpdateAggregate() {
     } else {
         withRepositoryUrl(aggregate.scmUrl) { authUrl ->
             dir(workDir) {
-                sh "git push '${authUrl}' '${aggregate.branch}'"
+                sh "git push \"${authUrl}\" '${aggregate.branch}'"
             }
         }
     }
