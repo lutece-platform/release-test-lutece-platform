@@ -246,7 +246,8 @@ def mustRunTests(resource) {
 // ========================================================================
 
 /**
- * Clones a resource on its release branch into the work directory and returns the directory.
+ * Clones a resource on its release branch into the work directory and returns the directory. The commit of the release branch at clone time
+ * is kept in .git/releaser-origin-sha for the rollback, and the remote URL is reset to the plain one so that no token stays in .git/config.
  */
 def cloneResource(resource) {
     def workDir = "${env.WORK_DIR}/${resource.artifactId}".toString()
@@ -255,16 +256,40 @@ def cloneResource(resource) {
         sh "git clone --branch '${resource.branch}' \"${authUrl}\" '${workDir}'"
     }
     dir(workDir) {
+        sh "git remote set-url origin '${resource.scmUrl.replaceFirst('^scm:git:', '')}'"
         sh "git config user.email '${params.GIT_USER_EMAIL}'"
         sh "git config user.name '${params.GIT_USER_NAME}'"
+        sh 'git rev-parse HEAD > .git/releaser-origin-sha'
     }
     return workDir
 }
 
 /**
- * Releases a resource cloned in a directory, following RELEASE.md : tests, release version, commit and tag (all local), then in one go
- * push, Nexus deploy, master merge (stable only) and next snapshot. In dry run the local part runs and the publication is only logged.
- * The resource is recorded in the report right after its Nexus deploy, the point of no return.
+ * Abbreviated commit id for the report.
+ */
+def shortSha(String sha) {
+    return sha.length() > 7 ? sha.substring(0, 7) : sha
+}
+
+/**
+ * Commit of a remote branch, or an empty string when the branch does not exist.
+ */
+def remoteBranchSha(String workDir, String scmUrl, String branch) {
+    def sha = ''
+    withRepositoryUrl(scmUrl) { authUrl ->
+        dir(workDir) {
+            sha = sh(script: "git ls-remote \"${authUrl}\" 'refs/heads/${branch}' | cut -f1", returnStdout: true).trim()
+        }
+    }
+    return sha
+}
+
+/**
+ * Releases a resource cloned in a directory in the order of the releaser workflow : everything Git first (release commit and tag pushed,
+ * tag merged into the master branch for a stable version, next snapshot pushed), the Nexus deploy from the tag LAST. Any failure rolls the
+ * repository back like the releaser does (release branch and master branch force-pushed to their commits of before the release, tag
+ * deleted) : as nothing is in Nexus before the last command, the same version can be released again. The resource is recorded in the report
+ * once deployed. In dry run the local part runs and the publication is only logged.
  */
 def releaseResource(String workDir, resource, boolean isAggregate) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
@@ -279,66 +304,124 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     }
 
     setResourceVersion(workDir, resource, resource.targetVersion)
+    def releaseSha = ''
     dir(workDir) {
         sh """
             git add -u
             git diff --cached --quiet && echo 'Version already at ${resource.targetVersion} — nothing to commit' || git commit -m "release: ${tag}"
             git tag -fa '${tag}' -m "Release ${resource.artifactId} ${resource.targetVersion}"
         """
+        releaseSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
     }
 
     if (isDryRun()) {
         echo "[DRY-RUN] Would push ${resource.branch} and tag ${tag}"
-        echo "[DRY-RUN] Would deploy ${coordinates(resource)}:${resource.targetVersion} to Nexus"
         if (resource.masterBranch) {
-            echo "[DRY-RUN] Would merge ${resource.branch} into ${resource.masterBranch}"
+            echo "[DRY-RUN] Would merge ${tag} into ${resource.masterBranch}"
         }
         echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
+        echo "[DRY-RUN] Would deploy ${coordinates(resource)}:${resource.targetVersion} to Nexus from ${tag}"
         recordReleased(resource, isAggregate)
         return
     }
 
-    withRepositoryUrl(resource.scmUrl) { authUrl ->
-        dir(workDir) {
-            sh "git push \"${authUrl}\" '${resource.branch}'"
-            sh "git push \"${authUrl}\" 'refs/tags/${tag}'"
-        }
-    }
+    def originSha = readFile("${workDir}/.git/releaser-origin-sha").trim()
+    def originMasterSha = resource.masterBranch ? remoteBranchSha(workDir, resource.scmUrl, resource.masterBranch) : ''
 
-    dir(workDir) {
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true"
-    }
-    recordReleased(resource, isAggregate)
-    cleanWorkTree(workDir)
-
-    withRepositoryUrl(resource.scmUrl) { authUrl ->
-        dir(workDir) {
-            if (resource.masterBranch) {
-                sh """
-                    git fetch "${authUrl}" '${resource.masterBranch}:${resource.masterBranch}' || git branch '${resource.masterBranch}' 'refs/remotes/origin/${resource.masterBranch}'
-                    git checkout '${resource.masterBranch}'
-                    git merge '${resource.branch}' -m "Merge ${resource.branch} for release ${tag}"
-                    git push "${authUrl}" '${resource.masterBranch}'
-                    git checkout '${resource.branch}'
-                """
-            }
-        }
-    }
-
-    if (resource.nextSnapshotVersion) {
-        setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
+    try {
         withRepositoryUrl(resource.scmUrl) { authUrl ->
             dir(workDir) {
-                sh """
-                    git add -u
-                    git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
-                    git push "${authUrl}" '${resource.branch}'
-                """
+                sh "git push \"${authUrl}\" '${resource.branch}'"
+                sh "git push \"${authUrl}\" 'refs/tags/${tag}'"
+            }
+        }
+
+        if (resource.masterBranch) {
+            if (!originMasterSha) {
+                error("Branch ${resource.masterBranch} not found on ${resource.scmUrl} : cannot merge ${tag} into it.")
+            }
+            withRepositoryUrl(resource.scmUrl) { authUrl ->
+                dir(workDir) {
+                    sh """
+                        git fetch "${authUrl}" '${resource.masterBranch}:${resource.masterBranch}'
+                        git checkout '${resource.masterBranch}'
+                        git merge -m "Merge ${tag} into ${resource.masterBranch}" '${tag}^{commit}'
+                        git push "${authUrl}" '${resource.masterBranch}'
+                        git checkout '${resource.branch}'
+                    """
+                }
+            }
+        }
+
+        if (resource.nextSnapshotVersion) {
+            setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
+            withRepositoryUrl(resource.scmUrl) { authUrl ->
+                dir(workDir) {
+                    sh """
+                        git add -u
+                        git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
+                        git push "${authUrl}" '${resource.branch}'
+                    """
+                }
+            }
+        }
+
+        dir(workDir) {
+            sh "git checkout -q 'refs/tags/${tag}'"
+            sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true"
+        }
+    } catch (Throwable e) {
+        rollbackResource(workDir, resource, tag, releaseSha, originSha, originMasterSha)
+        throw e
+    }
+
+    recordReleased(resource, isAggregate)
+    cleanWorkTree(workDir)
+    dir(workDir) {
+        sh "git checkout -q '${resource.branch}'"
+    }
+    echo "Released ${coordinates(resource)} ${resource.targetVersion}"
+}
+
+/**
+ * Rolls a failed release back, as GitResourceService.rollbackRelease does in the releaser : the release branch and the master branch are
+ * force-pushed to their commits of before the release, the tag is deleted when it still points to the release commit. Every command is
+ * attempted even if a previous one fails, and the outcome goes to the report.
+ */
+def rollbackResource(String workDir, resource, String tag, String releaseSha, String originSha, String originMasterSha) {
+    echo "=== Rolling back ${coordinates(resource)} ${resource.targetVersion} ==="
+    def done = []
+    def failed = []
+    withRepositoryUrl(resource.scmUrl) { authUrl ->
+        dir(workDir) {
+            if (sh(script: "git push --force \"${authUrl}\" '${originSha}:refs/heads/${resource.branch}'", returnStatus: true) == 0) {
+                done << "${resource.branch} reset to ${shortSha(originSha)}"
+            } else {
+                failed << "${resource.branch} NOT reset to ${shortSha(originSha)}"
+            }
+            if (originMasterSha) {
+                if (sh(script: "git push --force \"${authUrl}\" '${originMasterSha}:refs/heads/${resource.masterBranch}'", returnStatus: true) == 0) {
+                    done << "${resource.masterBranch} reset to ${shortSha(originMasterSha)}"
+                } else {
+                    failed << "${resource.masterBranch} NOT reset to ${shortSha(originMasterSha)}"
+                }
+            }
+            def remoteTagSha = sh(script: "git ls-remote \"${authUrl}\" 'refs/tags/${tag}^{}' | cut -f1", returnStdout: true).trim()
+            if (!remoteTagSha) {
+                done << "tag ${tag} not on the remote"
+            } else if (remoteTagSha == releaseSha) {
+                if (sh(script: "git push \"${authUrl}\" ':refs/tags/${tag}'", returnStatus: true) == 0) {
+                    done << "tag ${tag} deleted"
+                } else {
+                    failed << "tag ${tag} NOT deleted"
+                }
+            } else {
+                failed << "tag ${tag} kept : it does not point to the release commit"
             }
         }
     }
-
-    echo "Released ${coordinates(resource)} ${resource.targetVersion}"
+    def status = failed ? 'INCOMPLETE ROLLBACK, fix by hand' : 'rolled back'
+    appendReport("${coordinates(resource)} ${resource.targetVersion} ${status} : ${(done + failed).join(', ')}")
 }
 
 // ========================================================================
