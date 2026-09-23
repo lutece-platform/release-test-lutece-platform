@@ -54,8 +54,8 @@
         <lutece.core.version>8.0.1</lutece.core.version>
 
         <!-- Test components on GitHub (lutece-platform) -->
-        <lutece.plugin-releaser-test.version>6.2.3-SNAPSHOT</lutece.plugin-releaser-test.version>
-        <lutece.releaser-test-redmine-component.version>1.0.13-SNAPSHOT</lutece.releaser-test-redmine-component.version>
+        <lutece.plugin-releaser-test.version>6.2.3</lutece.plugin-releaser-test.version>
+        <lutece.releaser-test-redmine-component.version>1.0.13</lutece.releaser-test-redmine-component.version>
         <lutece.releaser-test-redmine-component-buttom.version>1.0.2-SNAPSHOT</lutece.releaser-test-redmine-component-buttom.version>
         <lutece.module-testrelease.version>0.1.12-SNAPSHOT</lutece.module-testrelease.version>
 
