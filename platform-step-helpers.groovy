@@ -74,13 +74,29 @@ def appendReport(String line) {
 }
 
 /**
- * Records a released resource in the report.
+ * Records a released resource in the report, as soon as it is published (tag pushed and Nexus deploy done) : a later failure (master merge,
+ * next snapshot) must not hide a published version from the releaser. The aggregate goes in aggregateVersion, a component in releasedVersions.
  */
-def recordReleased(resource) {
+def recordReleased(resource, boolean isAggregate) {
     def report = readReport()
-    report.releasedVersions[coordinates(resource)] = resource.targetVersion
-    report.report = (report.report ?: '') + "Released ${coordinates(resource)} ${resource.targetVersion}\n"
+    if (isAggregate) {
+        report.aggregateVersion = resource.targetVersion
+        report.report = (report.report ?: '') + "Released aggregate ${coordinates(resource)} ${resource.targetVersion}\n"
+    } else {
+        report.releasedVersions[coordinates(resource)] = resource.targetVersion
+        report.report = (report.report ?: '') + "Released ${coordinates(resource)} ${resource.targetVersion}\n"
+    }
     writeReport(report)
+}
+
+/**
+ * Restores the work tree to the last commit and removes the build outputs, so that files touched by Maven (even tracked ones, like a
+ * target/ directory committed by mistake) never block a checkout nor end up in a release commit.
+ */
+def cleanWorkTree(String workDir) {
+    dir(workDir) {
+        sh 'git reset -q --hard HEAD && git clean -fdq'
+    }
 }
 
 // ========================================================================
@@ -248,22 +264,24 @@ def cloneResource(resource) {
 /**
  * Releases a resource cloned in a directory, following RELEASE.md : tests, release version, commit and tag (all local), then in one go
  * push, Nexus deploy, master merge (stable only) and next snapshot. In dry run the local part runs and the publication is only logged.
+ * The resource is recorded in the report right after its Nexus deploy, the point of no return.
  */
-def releaseResource(String workDir, resource) {
+def releaseResource(String workDir, resource, boolean isAggregate) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
     echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}) ==="
 
-    dir(workDir) {
-        if (mustRunTests(resource)) {
+    if (mustRunTests(resource)) {
+        dir(workDir) {
             echo "Running the tests of ${resource.artifactId}"
             sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q"
         }
+        cleanWorkTree(workDir)
     }
 
     setResourceVersion(workDir, resource, resource.targetVersion)
     dir(workDir) {
         sh """
-            git add -A
+            git add -u
             git diff --cached --quiet && echo 'Version already at ${resource.targetVersion} — nothing to commit' || git commit -m "release: ${tag}"
             git tag -fa '${tag}' -m "Release ${resource.artifactId} ${resource.targetVersion}"
         """
@@ -276,6 +294,7 @@ def releaseResource(String workDir, resource) {
             echo "[DRY-RUN] Would merge ${resource.branch} into ${resource.masterBranch}"
         }
         echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
+        recordReleased(resource, isAggregate)
         return
     }
 
@@ -289,6 +308,8 @@ def releaseResource(String workDir, resource) {
     dir(workDir) {
         sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true"
     }
+    recordReleased(resource, isAggregate)
+    cleanWorkTree(workDir)
 
     withRepositoryUrl(resource.scmUrl) { authUrl ->
         dir(workDir) {
@@ -309,7 +330,7 @@ def releaseResource(String workDir, resource) {
         withRepositoryUrl(resource.scmUrl) { authUrl ->
             dir(workDir) {
                 sh """
-                    git add -A
+                    git add -u
                     git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
                     git push "${authUrl}" '${resource.branch}'
                 """
@@ -398,9 +419,8 @@ def stageReleaseComponents() {
     components.each { component ->
         def workDir = cloneResource(component)
         withJdk(detectTargetJdk(workDir)) {
-            releaseResource(workDir, component)
+            releaseResource(workDir, component, false)
         }
-        recordReleased(component)
     }
 }
 
@@ -416,7 +436,7 @@ def stageUpdateAggregate() {
 
     dir(workDir) {
         sh """
-            git add -A
+            git add -u
             git diff --cached --quiet && echo 'Aggregate POM already up to date — nothing to commit' || git commit -m "chore: update versions for the release of ${aggregate.artifactId} ${aggregate.targetVersion}"
         """
     }
@@ -443,12 +463,8 @@ def stageReleaseAggregate() {
     def aggregate = plan().aggregate
     def workDir = env.AGGREGATE_DIR
     withJdk(detectTargetJdk(workDir)) {
-        releaseResource(workDir, aggregate)
+        releaseResource(workDir, aggregate, true)
     }
-    def report = readReport()
-    report.aggregateVersion = aggregate.targetVersion
-    report.report = (report.report ?: '') + "Released aggregate ${coordinates(aggregate)} ${aggregate.targetVersion}\n"
-    writeReport(report)
 }
 
 /**
