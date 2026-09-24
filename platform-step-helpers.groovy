@@ -345,12 +345,7 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
                     sh """
                         git fetch "${authUrl}" '${resource.masterBranch}:${resource.masterBranch}'
                         git checkout '${resource.masterBranch}'
-                        if ! git merge -q --ff-only '${tag}^{commit}'; then
-                            git merge -q -s ours --no-commit '${tag}^{commit}'
-                            git read-tree -u --reset '${tag}^{commit}'
-                            git commit -q -m "Merge ${tag} into ${resource.masterBranch}"
-                        fi
-                        git diff --quiet '${tag}^{commit}' HEAD
+                        git merge -m "Merge ${tag} into ${resource.masterBranch}" '${tag}^{commit}'
                         git push "${authUrl}" '${resource.masterBranch}'
                         git checkout '${resource.branch}'
                     """
