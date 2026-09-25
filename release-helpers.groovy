@@ -216,13 +216,14 @@ in the job's SCM — otherwise the release would be pushed to the wrong branch."
 }
 
 /**
- * Branch a stable release is promoted to : MASTER_BRANCH, 'master' when empty.
+ * Branch a stable release is promoted to : MASTER_BRANCH, empty = no promotion.
  * The releaser derives it from the release branch (master for develop,
- * master_core7 for develop_core7), like the classic component release.
+ * master_core7 for develop_core7) and sends it empty when the release branch
+ * has no master counterpart, like the classic component release which then
+ * skips the merge back. A manual build keeps the parameter default (master).
  */
 def resolveMasterBranch() {
-    def explicit = params.MASTER_BRANCH?.trim()
-    return explicit ?: 'master'
+    return params.MASTER_BRANCH?.trim() ?: ''
 }
 
 /**
@@ -744,7 +745,7 @@ def stageInitialize() {
     echo "Release version      : ${env.COMPUTED_RELEASE_VERSION}"
     echo "Next SNAPSHOT version: ${env.COMPUTED_NEXT_SNAPSHOT}"
     if (env.IS_PRERELEASE == 'true') {
-        echo "${prereleaseLabel()}: ${env.MASTER_BRANCH} is NOT touched, deploy runs from ${env.MONOREPO_BRANCH}, SNAPSHOT restored afterwards"
+        echo "${prereleaseLabel()}: no master promotion, deploy runs from ${env.MONOREPO_BRANCH}, SNAPSHOT restored afterwards"
     }
 
     env.STARTERS_TO_RELEASE = resolveStartersToRelease(params.RELEASE_TARGET)
@@ -945,7 +946,12 @@ def stageTagRelease() {
 def stagePromoteToMaster() {
     def master = env.MASTER_BRANCH
     if (env.IS_PRERELEASE == 'true') {
-        echo "${prereleaseLabel()}: ${master} is not touched by a pre-release"
+        echo "${prereleaseLabel()}: no master promotion for a pre-release"
+        return
+    }
+    if (!master) {
+        echo "MASTER_BRANCH is empty: the release branch has no master counterpart, no promotion"
+        appendReport("No promotion: MASTER_BRANCH is empty (release branch without master counterpart)")
         return
     }
     if (isSingleModuleRelease()) {
