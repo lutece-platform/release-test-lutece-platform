@@ -94,6 +94,11 @@ pipeline {
             description: 'Branche de release de ce depot. Vide = branche courante si elle est connue (develop, develop_core7, develop_core8), sinon develop pour la V8 et develop_core7 pour la V7.'
         )
         string(
+            name: 'MASTER_BRANCH',
+            defaultValue: 'master',
+            description: 'Branche de promotion d\'une release stable (master pour develop, master_core7 pour develop_core7). Doit exister sur le depot distant, sinon le build echoue avant la promotion.'
+        )
+        string(
             name: 'JDK_TOOL_MAP',
             defaultValue: '',
             description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Vide = convention temurin-{version}-jdk.'

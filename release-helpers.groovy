@@ -216,6 +216,16 @@ in the job's SCM — otherwise the release would be pushed to the wrong branch."
 }
 
 /**
+ * Branch a stable release is promoted to : MASTER_BRANCH, 'master' when empty.
+ * The releaser derives it from the release branch (master for develop,
+ * master_core7 for develop_core7), like the classic component release.
+ */
+def resolveMasterBranch() {
+    def explicit = params.MASTER_BRANCH?.trim()
+    return explicit ?: 'master'
+}
+
+/**
  * Determines the branch the workspace actually holds.
  *
  * Jenkins checks out a detached SHA, so `git rev-parse --abbrev-ref HEAD`
@@ -649,6 +659,7 @@ def stageInitialize() {
     //    develop_core7 and the V8 line on develop.
     env.LUTECE_MAJOR_RESOLVED = detectLuteceMajor()
     env.MONOREPO_BRANCH = resolveMonorepoBranch()
+    env.MASTER_BRANCH = resolveMasterBranch()
     env.PLATFORM_TARGET_JDK = detectTargetJdk()
     env.PLATFORM_JDK_TOOL = jdkToolName(env.PLATFORM_TARGET_JDK)
 
@@ -733,7 +744,7 @@ def stageInitialize() {
     echo "Release version      : ${env.COMPUTED_RELEASE_VERSION}"
     echo "Next SNAPSHOT version: ${env.COMPUTED_NEXT_SNAPSHOT}"
     if (env.IS_PRERELEASE == 'true') {
-        echo "${prereleaseLabel()}: master is NOT touched, deploy runs from ${env.MONOREPO_BRANCH}, SNAPSHOT restored afterwards"
+        echo "${prereleaseLabel()}: ${env.MASTER_BRANCH} is NOT touched, deploy runs from ${env.MONOREPO_BRANCH}, SNAPSHOT restored afterwards"
     }
 
     env.STARTERS_TO_RELEASE = resolveStartersToRelease(params.RELEASE_TARGET)
@@ -932,25 +943,31 @@ def stageTagRelease() {
  * Pre-releases (beta / RC) never touch master.
  */
 def stagePromoteToMaster() {
+    def master = env.MASTER_BRANCH
     if (env.IS_PRERELEASE == 'true') {
-        echo "${prereleaseLabel()}: master is not touched by a pre-release"
+        echo "${prereleaseLabel()}: ${master} is not touched by a pre-release"
         return
     }
     if (isSingleModuleRelease()) {
-        echo "Single-module release: master is not touched (other modules may still be in SNAPSHOT)"
+        echo "Single-module release: ${master} is not touched (other modules may still be in SNAPSHOT)"
         return
+    }
+    def remoteMaster = sh(script: "git ls-remote --heads origin '${master}' | cut -f1", returnStdout: true).trim()
+    if (!remoteMaster) {
+        error("Branch ${master} does not exist on the remote : create it (or fix MASTER_BRANCH) before promoting the release.")
     }
     if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would merge ${env.MONOREPO_BRANCH} into master"
+        echo "[DRY-RUN] Would merge ${env.MONOREPO_BRANCH} into ${master}"
         return
     }
 
-    sh "git checkout master"
+    sh "git fetch origin '${master}:${master}' || git branch '${master}' '${remoteMaster}'"
+    sh "git checkout '${master}'"
     sh "git merge ${env.MONOREPO_BRANCH} -m \"Merge ${env.MONOREPO_BRANCH} for release ${env.RELEASE_TAGS}\""
-    sh "git push origin master"
+    sh "git push origin '${master}'"
     sh "git checkout ${env.MONOREPO_BRANCH}"
 
-    appendReport("Promoted to master: ${env.RELEASE_TAGS}")
+    appendReport("Promoted to ${master}: ${env.RELEASE_TAGS}")
 }
 
 /**
