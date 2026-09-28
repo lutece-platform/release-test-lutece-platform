@@ -964,6 +964,7 @@ def stagePromoteToMaster() {
     }
     if (params.DRY_RUN) {
         echo "[DRY-RUN] Would merge ${env.MONOREPO_BRANCH} into ${master}"
+        appendReport("Promotion (dry-run): ${env.MONOREPO_BRANCH} -> ${master}")
         return
     }
 
