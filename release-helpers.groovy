@@ -49,8 +49,8 @@ def padPrereleaseNumber(String raw) {
  *   rc   -> 8.0.0-RC-01
  */
 def qualifyVersion(String base) {
-    def type = env.PRERELEASE_TYPE ?: 'none'
-    if (type == 'none') {
+    def type = env.PRERELEASE_TYPE ?: 'stable'
+    if (type == 'stable') {
         return base
     }
     def qualifier = (type == 'rc') ? 'RC' : type
@@ -72,8 +72,8 @@ def stripQualifier(String version) {
  * Human-readable label for the current build type, used in logs and reports.
  */
 def prereleaseLabel() {
-    def type = env.PRERELEASE_TYPE ?: 'none'
-    if (type == 'none') {
+    def type = env.PRERELEASE_TYPE ?: 'stable'
+    if (type == 'stable') {
         return 'Stable'
     }
     if (type == 'rc') {
@@ -641,10 +641,13 @@ def generateReleaseReport() {
  * Stage 0 — Initialize: configure git, compute versions, create report.
  */
 def stageInitialize() {
-    // -- Pre-release type: none / beta / rc
+    // -- Release type: stable / beta / rc, mandatory (none = not chosen)
     env.PRERELEASE_TYPE = params.PRERELEASE_TYPE?.trim()?.toLowerCase() ?: 'none'
+    if (!(env.PRERELEASE_TYPE in ['stable', 'beta', 'rc'])) {
+        error("PRERELEASE_TYPE is required: stable, beta or rc (got '${env.PRERELEASE_TYPE}')")
+    }
     env.PRERELEASE_NUM = padPrereleaseNumber(params.PRERELEASE_NUMBER)
-    env.IS_PRERELEASE = (env.PRERELEASE_TYPE != 'none') ? 'true' : 'false'
+    env.IS_PRERELEASE = (env.PRERELEASE_TYPE != 'stable') ? 'true' : 'false'
 
     configFileProvider([configFile(fileId: params.MAVEN_SETTINGS_ID, variable: 'MVN_SETTINGS_TMP')]) {
         sh "cp \${MVN_SETTINGS_TMP} ${WORKSPACE}/maven-settings.xml"

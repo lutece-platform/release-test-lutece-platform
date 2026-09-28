@@ -75,13 +75,13 @@ pipeline {
         )
         choice(
             name: 'PRERELEASE_TYPE',
-            choices: ['none', 'beta', 'rc'],
-            description: 'Type de release.\nnone = release stable (8.0.0).\nbeta = pre-release beta (8.0.0-beta-01).\nrc = release candidate (8.0.0-RC-01).\nbeta et rc ne mergent pas sur master et restaurent la version SNAPSHOT apres le deploy.'
+            choices: ['none', 'stable', 'beta', 'rc'],
+            description: 'Type de release, obligatoire.\nnone = aucun type choisi : le build s\'arrete a l\'initialisation.\nstable = release stable (8.0.0).\nbeta = pre-release beta (8.0.0-beta-01).\nrc = release candidate (8.0.0-RC-01).\nbeta et rc ne mergent pas sur master et restaurent la version SNAPSHOT apres le deploy.'
         )
         string(
             name: 'PRERELEASE_NUMBER',
             defaultValue: '1',
-            description: 'Numero de la pre-release (1, 2, 3...), complete sur 2 chiffres : 1 -> beta-01. Ignore si PRERELEASE_TYPE = none.'
+            description: 'Numero de la pre-release (1, 2, 3...), complete sur 2 chiffres : 1 -> beta-01. Ignore si PRERELEASE_TYPE = stable.'
         )
         choice(
             name: 'LUTECE_MAJOR',
