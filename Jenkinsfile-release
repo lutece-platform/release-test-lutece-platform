@@ -212,12 +212,15 @@ pipeline {
         stage('Release Report') {
             steps {
                 script { helpers.stageReleaseReport() }
-                archiveArtifacts artifacts: 'release-report.txt', fingerprint: true
             }
         }
     }
 
     post {
+        always {
+            // Archived even on failure so the releaser can read the partial report
+            archiveArtifacts artifacts: 'release-report.txt', fingerprint: true, allowEmptyArchive: true
+        }
         success {
             script { helpers.postSuccess() }
         }
