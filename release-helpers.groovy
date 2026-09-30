@@ -69,6 +69,20 @@ def stripQualifier(String version) {
 }
 
 /**
+ * Writes the script git calls for a username or a password : it answers with the GITHUB_LOGIN and GITHUB_TOKEN build parameters, read
+ * from the environment. The token thus never appears in a command line, a URL or the clone configuration ; GIT_ASKPASS points to this script.
+ */
+def writeAskpassScript() {
+    writeFile file: env.GIT_ASKPASS, text: '''#!/bin/sh
+case "$1" in
+  Username*) printf '%s\\n' "$GITHUB_LOGIN" ;;
+  *)         printf '%s\\n' "$GITHUB_TOKEN" ;;
+esac
+'''
+    sh "chmod 700 '${env.GIT_ASKPASS}'"
+}
+
+/**
  * Human-readable label for the current build type, used in logs and reports.
  */
 def prereleaseLabel() {
@@ -679,9 +693,11 @@ def stageInitialize() {
 
     sh "git checkout -B ${env.MONOREPO_BRANCH}"
 
-    withCredentials([string(credentialsId: params.GITHUB_CREDENTIAL_ID, variable: 'GITHUB_TOKEN')]) {
-        sh 'git remote set-url origin https://$GITHUB_TOKEN@github.com/lutece-platform/release-test-lutece-platform.git'
+    if (!params.GITHUB_LOGIN?.trim() || !params.GITHUB_TOKEN?.toString()?.trim()) {
+        error('GITHUB_LOGIN and GITHUB_TOKEN are required : the releaser sends the credentials of the person releasing, a manual build must type them.')
     }
+    writeAskpassScript()
+    sh 'git remote set-url origin https://github.com/lutece-platform/release-test-lutece-platform.git'
 
     def pomContent = readFile('pom.xml')
     def currentVersion

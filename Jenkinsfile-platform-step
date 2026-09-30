@@ -59,14 +59,24 @@ pipeline {
             description: 'Lancer les tests (lutece:exploded antrun:run -Dlutece-test-hsql test) avant la release des composants de packaging lutece-plugin ou lutece-core.'
         )
         string(
-            name: 'GITHUB_CREDENTIAL_ID',
-            defaultValue: 'github-token',
-            description: 'ID du credential Jenkins contenant le token GitHub (type: Secret text).'
+            name: 'GITHUB_LOGIN',
+            defaultValue: '',
+            description: 'Login GitHub de la personne qui lance la release (envoye par le releaser). Obligatoire si le plan contient un depot GitHub.'
+        )
+        password(
+            name: 'GITHUB_TOKEN',
+            defaultValue: '',
+            description: 'Token GitHub de cette personne, avec le droit d\'ecriture sur les depots du plan. Jamais affiche : git le lit par GIT_ASKPASS.'
         )
         string(
-            name: 'GITLAB_CREDENTIAL_ID',
-            defaultValue: 'gitlab-token',
-            description: 'ID du credential Jenkins contenant le token GitLab dev.lutece.paris.fr (type: Secret text, scope write_repository).'
+            name: 'GITLAB_LOGIN',
+            defaultValue: '',
+            description: 'Login GitLab dev.lutece.paris.fr de la personne qui lance la release (envoye par le releaser). Obligatoire si le plan contient un depot GitLab.'
+        )
+        password(
+            name: 'GITLAB_TOKEN',
+            defaultValue: '',
+            description: 'Token ou mot de passe GitLab de cette personne. Jamais affiche : git le lit par GIT_ASKPASS.'
         )
         string(
             name: 'MAVEN_SETTINGS_ID',
@@ -93,6 +103,9 @@ pipeline {
     environment {
         STEP_REPORT = "${WORKSPACE}/step-report.json"
         WORK_DIR = "${WORKSPACE}/work"
+        // git asks the login and the token to this script, written by the Initialize stage from the build parameters
+        GIT_ASKPASS = "${WORKSPACE}/.git-askpass.sh"
+        GIT_TERMINAL_PROMPT = '0'
     }
 
     stages {

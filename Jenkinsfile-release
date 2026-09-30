@@ -104,9 +104,14 @@ pipeline {
             description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Vide = convention temurin-{version}-jdk.'
         )
         string(
-            name: 'GITHUB_CREDENTIAL_ID',
-            defaultValue: 'github-token',
-            description: 'ID du credential Jenkins contenant le token GitHub (type: Secret text).'
+            name: 'GITHUB_LOGIN',
+            defaultValue: '',
+            description: 'Login GitHub de la personne qui lance la release (envoye par le releaser).'
+        )
+        password(
+            name: 'GITHUB_TOKEN',
+            defaultValue: '',
+            description: 'Token GitHub de cette personne, avec le droit d\'ecriture sur le depot. Jamais affiche : git le lit par GIT_ASKPASS.'
         )
         string(
             name: 'MAVEN_SETTINGS_ID',
@@ -127,6 +132,9 @@ pipeline {
 
     environment {
         RELEASE_REPORT = "${WORKSPACE}/release-report.txt"
+        // git asks the login and the token to this script, written by the Initialize stage from the build parameters
+        GIT_ASKPASS = "${WORKSPACE}/.git-askpass.sh"
+        GIT_TERMINAL_PROMPT = '0'
     }
 
     stages {

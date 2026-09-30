@@ -104,32 +104,50 @@ def cleanWorkTree(String workDir) {
 // ========================================================================
 
 /**
- * Credential id matching the host of a repository URL.
+ * Login and token of the person releasing for the host of a repository URL, GitHub or GitLab : the releaser sends them as build parameters,
+ * a manual build types them. No credential is stored in Jenkins.
  */
-def credentialIdFor(String scmUrl) {
-    return scmUrl.contains('github.com') ? params.GITHUB_CREDENTIAL_ID : params.GITLAB_CREDENTIAL_ID
+def credentialsFor(String scmUrl) {
+    def github = scmUrl.contains('github.com')
+    return [host : github ? 'GitHub' : 'GitLab',
+            login: github ? params.GITHUB_LOGIN : params.GITLAB_LOGIN,
+            token: (github ? params.GITHUB_TOKEN : params.GITLAB_TOKEN)?.toString()]
 }
 
 /**
- * Authenticated clone/push URL : GitHub takes the token as user, GitLab takes it as the password of the oauth2 user.
- * The token is NOT in the returned string : it holds a literal $GIT_TOKEN reference that only the shell expands, so the secret never
- * goes through Groovy string interpolation. Callers must put the URL between double quotes in the shell command.
+ * Writes the script git calls for a username or a password : it answers with the GITHUB_* or GITLAB_* build parameters, read from the
+ * environment, according to the host named in the prompt. The token thus never appears in a command line, a URL or the clone
+ * configuration ; GIT_ASKPASS points to this script and GIT_TERMINAL_PROMPT=0 forbids any interactive prompt.
  */
-def authenticatedUrl(String scmUrl) {
-    def url = scmUrl.replaceFirst('^scm:git:', '')
-    if (url.contains('github.com')) {
-        return url.replaceFirst('^https://', 'https://\\$GIT_TOKEN@')
+def writeAskpassScript() {
+    writeFile file: env.GIT_ASKPASS, text: '''#!/bin/sh
+case "$1" in
+  *github.com*) [ "${1#Username}" != "$1" ] && printf '%s\\n' "$GITHUB_LOGIN" || printf '%s\\n' "$GITHUB_TOKEN" ;;
+  *)            [ "${1#Username}" != "$1" ] && printf '%s\\n' "$GITLAB_LOGIN" || printf '%s\\n' "$GITLAB_TOKEN" ;;
+esac
+'''
+    sh "chmod 700 '${env.GIT_ASKPASS}'"
+}
+
+/**
+ * Fails before any clone when the plan references a host for which no login or token was received.
+ */
+def checkCredentials(thePlan) {
+    def resources = (thePlan.components ?: []) + (thePlan.aggregate ? [thePlan.aggregate] : [])
+    def missing = resources.findAll { r ->
+        def c = credentialsFor(r.scmUrl ?: '')
+        !c.login?.trim() || !c.token?.trim()
+    }.collect { r -> "${credentialsFor(r.scmUrl ?: '').host} (${r.artifactId})".toString() }.unique()
+    if (missing) {
+        error("Missing login or token for ${missing.join(', ')} : the releaser sends GITHUB_LOGIN/GITHUB_TOKEN and GITLAB_LOGIN/GITLAB_TOKEN from the credentials of the person releasing.")
     }
-    return url.replaceFirst('^https://', 'https://oauth2:\\$GIT_TOKEN@')
 }
 
 /**
- * Runs the closure with the authenticated URL of a repository, the GIT_TOKEN shell variable being bound by withCredentials (masked in the logs).
+ * Runs the closure with the plain URL of a repository : git authenticates through the askpass script, see writeAskpassScript.
  */
 def withRepositoryUrl(String scmUrl, Closure body) {
-    withCredentials([string(credentialsId: credentialIdFor(scmUrl), variable: 'GIT_TOKEN')]) {
-        body(authenticatedUrl(scmUrl))
-    }
+    body(scmUrl.replaceFirst('^scm:git:', ''))
 }
 
 // ========================================================================
@@ -469,6 +487,8 @@ def stageInitialize() {
     }
     env.PLAN_JSON = params.RELEASE_PLAN
     env.DRY_RUN = thePlan.dryRun ? 'true' : 'false'
+    checkCredentials(thePlan)
+    writeAskpassScript()
 
     configFileProvider([configFile(fileId: params.MAVEN_SETTINGS_ID, variable: 'MVN_SETTINGS_TMP')]) {
         sh "cp \${MVN_SETTINGS_TMP} ${WORKSPACE}/maven-settings.xml"
