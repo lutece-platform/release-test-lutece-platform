@@ -795,6 +795,14 @@ def stageUpdatePomVersions() {
     def pomFile = 'pom.xml'
     def singleModule = isSingleModuleRelease()
 
+    def parentVersion = params.PARENT_VERSION?.trim()
+    if (parentVersion) {
+        if (!params.DRY_RUN) {
+            sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${parentVersion}</version>|' ${pomFile}"
+        }
+        appendReport("${params.DRY_RUN ? '[DRY-RUN] Would set' : 'Set'} parent lutece-global-pom version to ${parentVersion}")
+    }
+
     if (singleModule) {
         _updatePomSingleModule(pomFile)
     } else {

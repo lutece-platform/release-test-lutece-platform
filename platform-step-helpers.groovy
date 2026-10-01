@@ -231,6 +231,16 @@ def withJdk(String major, Closure body) {
 // ========================================================================
 
 /**
+ * Sets the version of the parent POM of a resource, as chosen in the releaser : the same edit as the one applied to the aggregate.
+ */
+def setParentVersion(String workDir, String parentVersion) {
+    dir(workDir) {
+        sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${parentVersion}</version>|' pom.xml"
+    }
+    echo "Parent version -> ${parentVersion}"
+}
+
+/**
  * Sets the version of a resource everywhere the releaser does : the POM (versions:set), the plugin descriptors
  * webapp/WEB-INF/plugins/*.xml, and for lutece-core the descriptor webapp/WEB-INF/conf/core.xml and AppInfo.java.
  */
@@ -321,6 +331,10 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         cleanWorkTree(workDir)
     }
 
+    if (resource.parentVersion && !isAggregate) {
+        setParentVersion(workDir, resource.parentVersion)
+        appendReport("${coordinates(resource)} : parent POM set to ${resource.parentVersion} before the release")
+    }
     setResourceVersion(workDir, resource, resource.targetVersion)
     def releaseSha = ''
     dir(workDir) {
@@ -456,6 +470,7 @@ def applyVersionUpdates(String workDir, aggregate) {
         if (aggregate.parentVersion) {
             sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${aggregate.parentVersion}</version>|' pom.xml"
             echo "Parent version -> ${aggregate.parentVersion}"
+            appendReport("${coordinates(aggregate)} : parent POM set to ${aggregate.parentVersion}")
         }
         def updates = aggregate.versionUpdates ?: [:]
         (updates.properties ?: [:]).each { name, version ->
