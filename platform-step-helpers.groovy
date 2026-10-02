@@ -90,6 +90,45 @@ def recordReleased(resource, boolean isAggregate) {
 }
 
 /**
+ * Records a component whose release failed and was rolled back. The release of the other components goes on : the releaser shows this one
+ * as rolled back and lets the person fix it and launch the step again.
+ */
+def recordFailed(resource, String reason) {
+    def report = readReport()
+    if (report.failedVersions == null) {
+        report.failedVersions = [:]
+    }
+    report.failedVersions[coordinates(resource)] = reason
+    report.report = (report.report ?: '') + "FAILED ${coordinates(resource)} ${resource.targetVersion} : ${reason} (rolled back)\n"
+    writeReport(report)
+}
+
+/**
+ * Whether a component of this step failed.
+ */
+def hasFailures() {
+    def failed = readReport().failedVersions
+    return failed != null && !failed.isEmpty()
+}
+
+/**
+ * Whether a component of the plan was published by this build.
+ */
+def isReleased(resource) {
+    def released = readReport().releasedVersions ?: [:]
+    return released.containsKey(coordinates(resource))
+}
+
+/**
+ * Records that the POM of the aggregate was pushed with the released versions.
+ */
+def markPomUpdated() {
+    def report = readReport()
+    report.pomUpdated = true
+    writeReport(report)
+}
+
+/**
  * Restores the work tree to the last commit and removes the build outputs, so that files touched by Maven (even tracked ones, like a
  * target/ directory committed by mistake) never block a checkout nor end up in a release commit.
  */
@@ -464,8 +503,22 @@ def rollbackResource(String workDir, resource, String tag, String releaseSha, St
  * Applies the version updates decided by the releaser to the POM of the aggregate : the parent version, the properties
  * (property name -> value) and the dependency declarations ("groupId:artifactId" -> version, the <version> tag right after the
  * <artifactId> tag). Nothing is guessed here : a version held by a property comes in "properties", never in "dependencies".
+ * The updates of the components of this step that were not published (failed, or never reached) are left out : the POM only
+ * references versions that exist.
  */
 def applyVersionUpdates(String workDir, aggregate) {
+    def skippedProperties = [] as Set
+    def skippedDependencies = [] as Set
+    plan().components.each { component ->
+        if (!isReleased(component)) {
+            if (component.versionProperty) {
+                skippedProperties.add(component.versionProperty)
+            } else {
+                skippedDependencies.add(coordinates(component))
+            }
+            appendReport("${coordinates(aggregate)} : version of ${coordinates(component)} left unchanged, the component was not published")
+        }
+    }
     dir(workDir) {
         if (aggregate.parentVersion) {
             sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${aggregate.parentVersion}</version>|' pom.xml"
@@ -474,10 +527,16 @@ def applyVersionUpdates(String workDir, aggregate) {
         }
         def updates = aggregate.versionUpdates ?: [:]
         (updates.properties ?: [:]).each { name, version ->
+            if (skippedProperties.contains(name)) {
+                return
+            }
             sh "sed -i 's|<${name}>[^<]*</${name}>|<${name}>${version}</${name}>|g' pom.xml"
             echo "Property ${name} -> ${version}"
         }
         (updates.dependencies ?: [:]).each { coords, version ->
+            if (skippedDependencies.contains(coords)) {
+                return
+            }
             def artifactId = coords.split(':')[1]
             sh "sed -i '/<artifactId>${artifactId}<\\/artifactId>/{n;s|<version>[^<]*</version>|<version>${version}</version>|}' pom.xml"
             echo "Dependency ${coords} -> ${version}"
@@ -511,7 +570,7 @@ def stageInitialize() {
     env.MAVEN_SETTINGS_XML = "${WORKSPACE}/maven-settings.xml"
 
     sh "rm -rf '${env.WORK_DIR}' && mkdir -p '${env.WORK_DIR}'"
-    writeReport([releasedVersions: [:], aggregateVersion: null, report: ''])
+    writeReport([releasedVersions: [:], failedVersions: [:], notProcessed: [], pomUpdated: false, aggregateVersion: null, report: ''])
 
     echo "=========================================="
     echo " Lutece Platform Step Pipeline"
@@ -526,7 +585,9 @@ def stageInitialize() {
 }
 
 /**
- * Stage 2 — Release the components in the order received, fail-fast, the report growing after each one.
+ * Stage 2 — Release the components in the order received, the report growing after each one. A failure does not stop the stage :
+ * the failed component is rolled back and recorded, the following ones are released, so that one broken component does not hold the
+ * whole step. The aggregate is then updated with the published versions only and not released, and the build ends in failure.
  */
 def stageReleaseComponents() {
     def components = plan().components
@@ -535,16 +596,22 @@ def stageReleaseComponents() {
         return
     }
     components.each { component ->
-        def workDir = cloneResource(component)
-        withJdk(detectTargetJdk(workDir)) {
-            releaseResource(workDir, component, false)
+        try {
+            def workDir = cloneResource(component)
+            withJdk(detectTargetJdk(workDir)) {
+                releaseResource(workDir, component, false)
+            }
+        } catch (Throwable e) {
+            echo "Release of ${coordinates(component)} failed : ${e.message}"
+            recordFailed(component, (e.message ?: e.class.simpleName).toString().readLines()[0])
         }
     }
 }
 
 /**
- * Stage 3 — Update the POM of the aggregate with the versions released (this step and the previous ones) and the parent version.
- * The plugins step stops here : the monorepo POM is committed and pushed, its release is the last step of the campaign.
+ * Stage 3 — Update the POM of the aggregate with the versions published (this step and the previous ones) and the parent version.
+ * The plugins step stops here : the monorepo POM is committed and pushed, its release is the last step of the campaign. When a
+ * component failed, the POM is pushed as well, with the published versions only, and the aggregate is not released.
  */
 def stageUpdateAggregate() {
     def aggregate = plan().aggregate
@@ -559,7 +626,7 @@ def stageUpdateAggregate() {
         """
     }
 
-    if (isAggregateReleased()) {
+    if (isAggregateReleased() && !hasFailures()) {
         return
     }
     if (isDryRun()) {
@@ -570,8 +637,13 @@ def stageUpdateAggregate() {
                 sh "git push \"${authUrl}\" '${aggregate.branch}'"
             }
         }
+        markPomUpdated()
     }
-    appendReport("Aggregate ${coordinates(aggregate)} : POM updated on ${aggregate.branch}, not released by this step.")
+    if (hasFailures()) {
+        appendReport("Aggregate ${coordinates(aggregate)} : POM updated on ${aggregate.branch} with the published versions only, NOT released because a component failed.")
+    } else {
+        appendReport("Aggregate ${coordinates(aggregate)} : POM updated on ${aggregate.branch}, not released by this step.")
+    }
 }
 
 /**
@@ -586,19 +658,51 @@ def stageReleaseAggregate() {
 }
 
 /**
- * Stage 5 — Final report.
+ * Stage 5 — Final report. When a component failed, the report says exactly what happened to each component and the build fails :
+ * the released versions are in Nexus and in the aggregate POM, the failed ones were rolled back, the ones never reached are listed.
  */
 def stageReport() {
-    appendReport("Pipeline completed : ${new Date()} — status ${currentBuild.result ?: 'SUCCESS'}")
+    def report = readReport()
+    def released = report.releasedVersions ?: [:]
+    def failed = report.failedVersions ?: [:]
+    def notProcessed = plan().components.findAll { !released.containsKey(coordinates(it)) && !failed.containsKey(coordinates(it)) }
+            .collect { coordinates(it) }
+    report.notProcessed = notProcessed
+    writeReport(report)
+
+    if (failed.isEmpty()) {
+        appendReport("Pipeline completed : ${new Date()} — status ${currentBuild.result ?: 'SUCCESS'}")
+        echo readFile(env.STEP_REPORT)
+        return
+    }
+    def summary = new StringBuilder()
+    summary << "STEP FAILED : ${failed.size()} component(s) could not be released.\n"
+    summary << "  Failed and rolled back (nothing published, repository restored) :\n"
+    failed.each { coords, reason -> summary << "    - ${coords} : ${reason}\n" }
+    summary << "  Published (in Nexus, referenced by the aggregate POM) :\n"
+    if (released.isEmpty()) {
+        summary << "    - none\n"
+    }
+    released.each { coords, version -> summary << "    - ${coords} ${version}\n" }
+    summary << "  Not processed :\n"
+    if (notProcessed.isEmpty()) {
+        summary << "    - none\n"
+    }
+    notProcessed.each { summary << "    - ${it}\n" }
+    summary << "  The aggregate was not released. Fix the failed component(s), then prepare the step again in the releaser : the published ones are shown as already released and will not be released twice."
+    appendReport(summary.toString())
     echo readFile(env.STEP_REPORT)
+    error("${failed.size()} component(s) failed, see the step report")
 }
 
 /**
- * Post — Failure : the partial report already lists what was released ; say so.
+ * Post — Failure : the partial report already lists what was released ; say so when the failure did not come from a component.
  */
 def postFailure() {
     try {
-        appendReport("FAILED at ${new Date()} : the resources listed in releasedVersions were released, the others were not. Prepare the step again in the releaser to release the remaining ones.")
+        if (!hasFailures()) {
+            appendReport("FAILED at ${new Date()} : the resources listed in releasedVersions were released, the others were not. Prepare the step again in the releaser to release the remaining ones.")
+        }
     } catch (Throwable e) {
         echo "Could not complete the report : ${e.message}"
     }

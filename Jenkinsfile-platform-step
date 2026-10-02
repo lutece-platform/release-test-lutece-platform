@@ -136,7 +136,7 @@ pipeline {
 
         stage('Release aggregate') {
             when {
-                expression { return helpers.isAggregateReleased() }
+                expression { return helpers.isAggregateReleased() && !helpers.hasFailures() }
             }
             steps {
                 script { helpers.stageReleaseAggregate() }
