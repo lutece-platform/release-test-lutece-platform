@@ -352,6 +352,39 @@ def remoteBranchSha(String workDir, String scmUrl, String branch) {
 }
 
 /**
+ * Refuses to release a resource whose POM, versions set, still declares SNAPSHOT artifacts : a SNAPSHOT parent, or a dependency whose
+ * declared version (properties resolved, every module of a multi-module build) is a SNAPSHOT. Declared versions, not resolved ones : a
+ * Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core without the POM declaring one, exactly as the maven-release-plugin
+ * of the classic release judges it. Runs before any commit, so nothing is to roll back.
+ */
+def checkSnapshotDependencies(String workDir, resource) {
+    dir(workDir) {
+        def parentVersion = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.version -DforceStdout 2>/dev/null | tail -1 || true", returnStdout: true).trim()
+        def declared = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null || true", returnStdout: true)
+        def snapshots = [] as Set
+        def current = [:]
+        declared.readLines().each { line ->
+            def m = (line =~ /<(groupId|artifactId|version)>([^<]*)<\/\1>/)
+            if (m.find()) {
+                current[m.group(1)] = m.group(2)
+                if (m.group(1) == 'version' && m.group(2).endsWith('-SNAPSHOT')) {
+                    snapshots.add("${current.groupId}:${current.artifactId}:${m.group(2)}".toString())
+                }
+            }
+        }
+        def problems = []
+        if (parentVersion.endsWith('-SNAPSHOT')) {
+            problems.add("parent ${parentVersion}".toString())
+        }
+        problems.addAll(snapshots)
+        if (!problems.isEmpty()) {
+            appendReport("${coordinates(resource)} : release refused, the POM rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
+            error("${coordinates(resource)} rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
+        }
+    }
+}
+
+/**
  * Releases a resource cloned in a directory in the order of the releaser workflow : everything Git first (release commit and tag pushed,
  * tag merged into the master branch for a stable version, next snapshot pushed), the Nexus deploy from the tag LAST. Any failure rolls the
  * repository back like the releaser does (release branch and master branch force-pushed to their commits of before the release, tag
@@ -383,6 +416,7 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         appendReport("${coordinates(resource)} : parent POM set to ${resource.parentVersion} before the release")
     }
     setResourceVersion(workDir, resource, resource.targetVersion)
+    checkSnapshotDependencies(workDir, resource)
     def releaseSha = ''
     dir(workDir) {
         sh """
