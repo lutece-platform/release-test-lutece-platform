@@ -803,6 +803,15 @@ def stageUpdatePomVersions() {
         appendReport("${params.DRY_RUN ? '[DRY-RUN] Would set' : 'Set'} parent lutece-global-pom version to ${parentVersion}")
     }
 
+    // lutece.core.version must be the core released by the campaign : set before the readiness validation reads the POM
+    def coreVersion = params.CORE_VERSION?.trim()
+    if (coreVersion) {
+        if (!params.DRY_RUN) {
+            sh "sed -i 's|<lutece.core.version>[^<]*</lutece.core.version>|<lutece.core.version>${coreVersion}</lutece.core.version>|' ${pomFile}"
+        }
+        appendReport("${params.DRY_RUN ? '[DRY-RUN] Would set' : 'Set'} lutece.core.version to ${coreVersion}")
+    }
+
     if (singleModule) {
         _updatePomSingleModule(pomFile)
     } else {

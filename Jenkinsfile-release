@@ -64,6 +64,11 @@ pipeline {
             description: 'Version du POM parent (lutece-global-pom) a poser dans le pom.xml racine avant la release. Vide = inchangee. Envoyee par le releaser quand la personne a choisi de mettre le parent a jour.'
         )
         string(
+            name: 'CORE_VERSION',
+            defaultValue: '',
+            description: 'Version de lutece-core a poser dans la propriete lutece.core.version du pom.xml racine avant la release. Vide = inchangee. Envoyee par le releaser quand la personne a choisi de corriger le POM avec la version releasee a l etape 3.'
+        )
+        string(
             name: 'NEXT_SNAPSHOT_VERSION',
             defaultValue: '',
             description: 'Prochaine version SNAPSHOT (ex: 8.0.1-SNAPSHOT). Vide = auto-calculée (patch+1).'
