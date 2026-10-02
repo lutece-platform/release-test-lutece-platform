@@ -366,6 +366,11 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         dir(workDir) {
             echo "Running the tests of ${resource.artifactId}"
             sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q"
+            // lutece-global-pom sets testFailureIgnore=true : Maven exits 0 whatever the tests say, the reports are the only truth
+            def failedClasses = sh(script: "grep -l -E '<(failure|error)[ >]' target/surefire-reports/*.xml 2>/dev/null | wc -l", returnStdout: true).trim()
+            if (failedClasses != '0') {
+                error("${failedClasses} test class(es) failed in ${resource.artifactId}, see target/surefire-reports")
+            }
         }
         cleanWorkTree(workDir)
     }
