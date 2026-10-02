@@ -366,10 +366,13 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         dir(workDir) {
             echo "Running the tests of ${resource.artifactId}"
             sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q"
-            // lutece-global-pom sets testFailureIgnore=true : Maven exits 0 whatever the tests say, the reports are the only truth
-            def failedClasses = sh(script: "grep -l -E '<(failure|error)[ >]' target/surefire-reports/*.xml 2>/dev/null | wc -l", returnStdout: true).trim()
-            if (failedClasses != '0') {
-                error("${failedClasses} test class(es) failed in ${resource.artifactId}, see target/surefire-reports")
+            // lutece-global-pom sets testFailureIgnore=true : Maven exits 0 whatever the tests say, the JUnit reports (TEST-*.xml) are the
+            // only truth. antrun_report.xml, written by the Lutece database setup, is not a test report.
+            def failedReports = sh(script: "grep -l -E '<(failure|error)[ >]' target/surefire-reports/TEST-*.xml 2>/dev/null || true", returnStdout: true).trim()
+            if (failedReports) {
+                def failedClasses = failedReports.readLines().collect { it.replaceAll('.*/TEST-', '').replaceAll('\\.xml$', '') }
+                sh "grep -h -E -o '<(failure|error)[^>]*' target/surefire-reports/TEST-*.xml | cut -c1-300 || true"
+                error("${failedClasses.size()} test class(es) failed in ${resource.artifactId} : ${failedClasses.join(', ')}")
             }
         }
         cleanWorkTree(workDir)
@@ -644,10 +647,11 @@ def stageUpdateAggregate() {
         }
         markPomUpdated()
     }
+    def verb = isDryRun() ? '[DRY-RUN] POM would be updated' : 'POM updated'
     if (hasFailures()) {
-        appendReport("Aggregate ${coordinates(aggregate)} : POM updated on ${aggregate.branch} with the published versions only, NOT released because a component failed.")
+        appendReport("Aggregate ${coordinates(aggregate)} : ${verb} on ${aggregate.branch} with the published versions only, NOT released because a component failed.")
     } else {
-        appendReport("Aggregate ${coordinates(aggregate)} : POM updated on ${aggregate.branch}, not released by this step.")
+        appendReport("Aggregate ${coordinates(aggregate)} : ${verb} on ${aggregate.branch}, not released by this step.")
     }
 }
 
@@ -680,22 +684,22 @@ def stageReport() {
         echo readFile(env.STEP_REPORT)
         return
     }
-    def summary = new StringBuilder()
-    summary << "STEP FAILED : ${failed.size()} component(s) could not be released.\n"
-    summary << "  Failed and rolled back (nothing published, repository restored) :\n"
-    failed.each { coords, reason -> summary << "    - ${coords} : ${reason}\n" }
-    summary << "  Published (in Nexus, referenced by the aggregate POM) :\n"
+    def lines = []
+    lines.add("STEP FAILED : ${failed.size()} component(s) could not be released.".toString())
+    lines.add('  Failed and rolled back (nothing published, repository restored) :')
+    failed.each { coords, reason -> lines.add("    - ${coords} : ${reason}".toString()) }
+    lines.add('  Published (in Nexus, referenced by the aggregate POM) :')
     if (released.isEmpty()) {
-        summary << "    - none\n"
+        lines.add('    - none')
     }
-    released.each { coords, version -> summary << "    - ${coords} ${version}\n" }
-    summary << "  Not processed :\n"
+    released.each { coords, version -> lines.add("    - ${coords} ${version}".toString()) }
+    lines.add('  Not processed :')
     if (notProcessed.isEmpty()) {
-        summary << "    - none\n"
+        lines.add('    - none')
     }
-    notProcessed.each { summary << "    - ${it}\n" }
-    summary << "  The aggregate was not released. Fix the failed component(s), then prepare the step again in the releaser : the published ones are shown as already released and will not be released twice."
-    appendReport(summary.toString())
+    notProcessed.each { lines.add("    - ${it}".toString()) }
+    lines.add('  The aggregate was not released. Fix the failed component(s), then prepare the step again in the releaser : the published ones are shown as already released and will not be released twice.')
+    appendReport(lines.join('\n'))
     echo readFile(env.STEP_REPORT)
     error("${failed.size()} component(s) failed, see the step report")
 }
