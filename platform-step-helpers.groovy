@@ -685,10 +685,10 @@ def stageReport() {
         return
     }
     def lines = []
-    lines.add("STEP FAILED : ${failed.size()} component(s) could not be released.".toString())
+    lines.add("STEP FAILED : ${failed.size()} component(s) could not be released.${isDryRun() ? ' [DRY-RUN : nothing was pushed nor published]' : ''}".toString())
     lines.add('  Failed and rolled back (nothing published, repository restored) :')
     failed.each { coords, reason -> lines.add("    - ${coords} : ${reason}".toString()) }
-    lines.add('  Published (in Nexus, referenced by the aggregate POM) :')
+    lines.add(isDryRun() ? '  Would be published (in Nexus, referenced by the aggregate POM) :' : '  Published (in Nexus, referenced by the aggregate POM) :')
     if (released.isEmpty()) {
         lines.add('    - none')
     }
