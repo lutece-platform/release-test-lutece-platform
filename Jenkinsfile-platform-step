@@ -85,8 +85,8 @@ pipeline {
         )
         string(
             name: 'JDK_TOOL_MAP',
-            defaultValue: '',
-            description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Vide = convention temurin-{version}-jdk.'
+            defaultValue: '8=temurin-11-jdk',
+            description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Sinon convention temurin-{version}-jdk. Par defaut Java 8 est bati avec le JDK 11, l\'outil temurin-8-jdk n\'existant pas.'
         )
         string(
             name: 'GIT_USER_NAME',
