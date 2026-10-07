@@ -43,7 +43,7 @@ pipeline {
     // Bootstrap toolchain only : each resource is built with the JDK matching
     // its own POM (targetJdk), see helpers.withJdk / JDK_TOOL_MAP.
     tools {
-        maven 'Maven 3.8.5'
+        maven 'maven-3.9.12'
         jdk 'temurin-17-jdk'
     }
 
