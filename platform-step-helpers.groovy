@@ -60,7 +60,10 @@ def readReport() {
  */
 def writeReport(report) {
     writeJSON file: env.STEP_REPORT, json: report, pretty: 2
-    archiveArtifacts artifacts: 'step-report.json', fingerprint: true
+    // archiveArtifacts resolves its pattern from the current dir() : called from inside a resource directory it would find nothing
+    dir(env.WORKSPACE) {
+        archiveArtifacts artifacts: 'step-report.json', fingerprint: true
+    }
 }
 
 /**
