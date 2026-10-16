@@ -388,11 +388,28 @@ def checkSnapshotDependencies(String workDir, resource) {
 }
 
 /**
+ * Compiles the main and test sources of the release commit, every type of resource, before anything is pushed : a resource that does
+ * not compile with its release versions and parent fails here, with nothing to roll back, instead of failing at the Nexus deploy after
+ * the pushes. The work tree is then restored to the release commit, so that no file touched by the build ends up in a later commit.
+ */
+def checkCompiles(String workDir, resource) {
+    dir(workDir) {
+        echo "Compiling ${resource.artifactId} ${resource.targetVersion} before any push"
+        def status = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q clean test-compile", returnStatus: true)
+        if (status != 0) {
+            error("${coordinates(resource)} ${resource.targetVersion} does not compile (mvn test-compile exit code ${status}), nothing was pushed")
+        }
+    }
+    cleanWorkTree(workDir)
+}
+
+/**
  * Releases a resource cloned in a directory in the order of the releaser workflow : everything Git first (release commit and tag pushed,
  * tag merged into the master branch for a stable version, next snapshot pushed), the Nexus deploy from the tag LAST. Any failure rolls the
  * repository back like the releaser does (release branch and master branch force-pushed to their commits of before the release, tag
- * deleted) : as nothing is in Nexus before the last command, the same version can be released again. The resource is recorded in the report
- * once deployed. In dry run the local part runs and the publication is only logged.
+ * deleted) : as nothing is in Nexus before the last command, the same version can be released again. The release commit is compiled
+ * before any push. The resource is recorded in the report once deployed. In dry run the local part runs, compilation included, and the
+ * publication is only logged.
  */
 def releaseResource(String workDir, resource, boolean isAggregate) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
@@ -429,6 +446,7 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         """
         releaseSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
     }
+    checkCompiles(workDir, resource)
 
     if (isDryRun()) {
         echo "[DRY-RUN] Would push ${resource.branch} and tag ${tag}"
