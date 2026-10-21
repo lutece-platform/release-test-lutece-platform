@@ -153,6 +153,8 @@ pipeline {
     post {
         always {
             archiveArtifacts artifacts: 'step-report.json', allowEmptyArchive: true, fingerprint: true
+            // Full output of the Maven and git commands of each resource, see helpers.runLogged
+            archiveArtifacts artifacts: 'work/logs/*.log', allowEmptyArchive: true
         }
         failure {
             script {

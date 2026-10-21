@@ -93,17 +93,70 @@ def recordReleased(resource, boolean isAggregate) {
 }
 
 /**
- * Records a component whose release failed and was rolled back. The release of the other components goes on : the releaser shows this one
- * as rolled back and lets the person fix it and launch the step again.
+ * Records a component whose release failed. The release of the other components goes on : the releaser shows this one as failed and lets
+ * the person fix it and launch the step again. The first line of the error is the reason, the next ones (error lines of the failed command)
+ * go under it in the report ; whether a rollback was needed is reported by rollbackResource.
  */
-def recordFailed(resource, String reason) {
+def recordFailed(resource, String error) {
+    def lines = error.readLines()
     def report = readReport()
     if (report.failedVersions == null) {
         report.failedVersions = [:]
     }
-    report.failedVersions[coordinates(resource)] = reason
-    report.report = (report.report ?: '') + "FAILED ${coordinates(resource)} ${resource.targetVersion} : ${reason} (rolled back)\n"
+    report.failedVersions[coordinates(resource)] = lines[0]
+    report.report = (report.report ?: '') + "FAILED ${coordinates(resource)} ${resource.targetVersion} : ${lines[0]}\n" + formatDetails(lines)
     writeReport(report)
+}
+
+/**
+ * Records a failure of the aggregate, during the update of its POM or its release, with the error lines of the failed command : without it
+ * the report would only hold the generic line of postFailure.
+ */
+def reportAggregateFailure(aggregate, String phase, Throwable e) {
+    def lines = (e.message ?: e.class.simpleName).toString().readLines()
+    appendReport("FAILED aggregate ${coordinates(aggregate)} ${aggregate.targetVersion} during the ${phase}${isDryRun() ? ' [DRY-RUN]' : ''} : ${lines[0]}\n" + formatDetails(lines).trim())
+}
+
+/**
+ * Indents the lines of an error that follow its first one, for the report.
+ */
+def formatDetails(List lines) {
+    return lines.drop(1).findAll { it.trim() }.collect { "    | ${it}\n" }.join('')
+}
+
+/**
+ * Runs a shell command of a resource in the current directory : its output goes to the console and to work/logs/<artifactId>.log, archived
+ * with the build. On failure the error holds a summary line, then the useful lines of the output (Maven [ERROR], git fatal or error, push
+ * rejected) : the report shows the cause, not only "script returned exit code 1". The command runs in its own shell with -e, so that a
+ * command of several lines stops at its first failure.
+ */
+def runLogged(resource, String label, String command) {
+    def logDir = "${env.WORK_DIR}/logs"
+    def base = "${logDir}/${resource.artifactId}"
+    sh "mkdir -p '${logDir}'"
+    writeFile file: "${base}.cmd.sh", text: command
+    sh """
+        echo '>>> ${label}' >> '${base}.log'
+        { sh -e '${base}.cmd.sh' 2>&1 && echo 0 > '${base}.rc' || echo \$? > '${base}.rc'; } | tee '${base}.out'
+        cat '${base}.out' >> '${base}.log'
+    """
+    def status = readFile("${base}.rc").trim()
+    if (status != '0') {
+        error("${label} failed (exit code ${status})\n${errorExcerpt("${base}.out")}")
+    }
+}
+
+/**
+ * The useful lines of a failed command output, at most 15 : Maven [ERROR] lines without its generic help lines, git fatal and error lines,
+ * rejected pushes.
+ */
+def errorExcerpt(String outFile) {
+    def excerpt = sh(script: """
+        grep -E '^\\[ERROR\\]|^(fatal|error|ERROR):|^ ! \\[' '${outFile}' \\
+          | grep -v -E '^\\[ERROR\\] *\$|-> \\[Help|^\\[ERROR\\] \\[Help|To see the full stack trace|Re-run Maven using|For more information about the errors' \\
+          | cut -c1-300 | head -15 || true
+    """, returnStdout: true).trim()
+    return excerpt ?: '(no error line found in the output : see work/logs in the build artifacts)'
 }
 
 /**
@@ -323,7 +376,7 @@ def cloneResource(resource) {
     def workDir = "${env.WORK_DIR}/${resource.artifactId}".toString()
     sh "rm -rf '${workDir}'"
     withRepositoryUrl(resource.scmUrl) { authUrl ->
-        sh "git clone --branch '${resource.branch}' \"${authUrl}\" '${workDir}'"
+        runLogged(resource, "Clone of ${resource.branch}", "git clone --branch '${resource.branch}' \"${authUrl}\" '${workDir}'")
     }
     dir(workDir) {
         sh "git remote set-url origin '${resource.scmUrl.replaceFirst('^scm:git:', '')}'"
@@ -395,10 +448,7 @@ def checkSnapshotDependencies(String workDir, resource) {
 def checkCompiles(String workDir, resource) {
     dir(workDir) {
         echo "Compiling ${resource.artifactId} ${resource.targetVersion} before any push"
-        def status = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q clean test-compile", returnStatus: true)
-        if (status != 0) {
-            error("${coordinates(resource)} ${resource.targetVersion} does not compile (mvn test-compile exit code ${status}), nothing was pushed")
-        }
+        runLogged(resource, 'Compilation of the release commit, nothing pushed (mvn test-compile)', "mvn -s ${env.MAVEN_SETTINGS_XML} -q clean test-compile")
     }
     cleanWorkTree(workDir)
 }
@@ -418,14 +468,15 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     if (mustRunTests(resource)) {
         dir(workDir) {
             echo "Running the tests of ${resource.artifactId}"
-            sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q"
+            runLogged(resource, 'Tests (mvn test)', "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q")
             // lutece-global-pom sets testFailureIgnore=true : Maven exits 0 whatever the tests say, the JUnit reports (TEST-*.xml) are the
             // only truth. antrun_report.xml, written by the Lutece database setup, is not a test report.
             def failedReports = sh(script: "grep -l -E '<(failure|error)[ >]' target/surefire-reports/TEST-*.xml 2>/dev/null || true", returnStdout: true).trim()
             if (failedReports) {
                 def failedClasses = failedReports.readLines().collect { it.replaceAll('.*/TEST-', '').replaceAll('\\.xml$', '') }
-                sh "grep -h -E -o '<(failure|error)[^>]*' target/surefire-reports/TEST-*.xml | cut -c1-300 || true"
-                error("${failedClasses.size()} test class(es) failed in ${resource.artifactId} : ${failedClasses.join(', ')}")
+                def failures = sh(script: "grep -h -E -o '<(failure|error)[^>]*' target/surefire-reports/TEST-*.xml | cut -c1-300 | head -15 || true", returnStdout: true).trim()
+                echo failures
+                error("${failedClasses.size()} test class(es) failed in ${resource.artifactId} : ${failedClasses.join(', ')}\n${failures}")
             }
         }
         cleanWorkTree(workDir)
@@ -465,8 +516,10 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     try {
         withRepositoryUrl(resource.scmUrl) { authUrl ->
             dir(workDir) {
-                sh "git push \"${authUrl}\" '${resource.branch}'"
-                sh "git push \"${authUrl}\" 'refs/tags/${tag}'"
+                runLogged(resource, "Push of ${resource.branch} and tag ${tag}", """
+                    git push "${authUrl}" '${resource.branch}'
+                    git push "${authUrl}" 'refs/tags/${tag}'
+                """)
             }
         }
 
@@ -476,13 +529,13 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             }
             withRepositoryUrl(resource.scmUrl) { authUrl ->
                 dir(workDir) {
-                    sh """
+                    runLogged(resource, "Merge of ${tag} into ${resource.masterBranch}", """
                         git fetch "${authUrl}" '${resource.masterBranch}:${resource.masterBranch}'
                         git checkout '${resource.masterBranch}'
                         git merge -m "Merge ${tag} into ${resource.masterBranch}" '${tag}^{commit}'
                         git push "${authUrl}" '${resource.masterBranch}'
                         git checkout '${resource.branch}'
-                    """
+                    """)
                 }
             }
         }
@@ -491,18 +544,18 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
             withRepositoryUrl(resource.scmUrl) { authUrl ->
                 dir(workDir) {
-                    sh """
+                    runLogged(resource, "Next development version ${resource.nextSnapshotVersion}", """
                         git add -u
                         git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
                         git push "${authUrl}" '${resource.branch}'
-                    """
+                    """)
                 }
             }
         }
 
         dir(workDir) {
             sh "git checkout -q 'refs/tags/${tag}'"
-            sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true"
+            runLogged(resource, "Nexus deploy from ${tag}", "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true")
         }
     } catch (Throwable e) {
         rollbackResource(workDir, resource, tag, releaseSha, originSha, originMasterSha)
@@ -666,7 +719,7 @@ def stageReleaseComponents() {
             }
         } catch (Throwable e) {
             echo "Release of ${coordinates(component)} failed : ${e.message}"
-            recordFailed(component, (e.message ?: e.class.simpleName).toString().readLines()[0])
+            recordFailed(component, (e.message ?: e.class.simpleName).toString())
         }
     }
 }
@@ -678,6 +731,18 @@ def stageReleaseComponents() {
  */
 def stageUpdateAggregate() {
     def aggregate = plan().aggregate
+    try {
+        updateAggregatePom(aggregate)
+    } catch (Throwable e) {
+        reportAggregateFailure(aggregate, 'update of its POM', e)
+        throw e
+    }
+}
+
+/**
+ * Clones the aggregate, applies the version updates and commits them ; pushes the POM when the aggregate is not released by this step.
+ */
+def updateAggregatePom(aggregate) {
     def workDir = cloneResource(aggregate)
     env.AGGREGATE_DIR = workDir
     applyVersionUpdates(workDir, aggregate)
@@ -697,7 +762,7 @@ def stageUpdateAggregate() {
     } else {
         withRepositoryUrl(aggregate.scmUrl) { authUrl ->
             dir(workDir) {
-                sh "git push \"${authUrl}\" '${aggregate.branch}'"
+                runLogged(aggregate, "Push of the updated POM on ${aggregate.branch}", "git push \"${authUrl}\" '${aggregate.branch}'")
             }
         }
         markPomUpdated()
@@ -716,8 +781,13 @@ def stageUpdateAggregate() {
 def stageReleaseAggregate() {
     def aggregate = plan().aggregate
     def workDir = env.AGGREGATE_DIR
-    withJdk(detectTargetJdk(workDir)) {
-        releaseResource(workDir, aggregate, true)
+    try {
+        withJdk(detectTargetJdk(workDir)) {
+            releaseResource(workDir, aggregate, true)
+        }
+    } catch (Throwable e) {
+        reportAggregateFailure(aggregate, 'release', e)
+        throw e
     }
 }
 
@@ -741,7 +811,7 @@ def stageReport() {
     }
     def lines = []
     lines.add("STEP FAILED : ${failed.size()} component(s) could not be released.${isDryRun() ? ' [DRY-RUN : nothing was pushed nor published]' : ''}".toString())
-    lines.add('  Failed and rolled back (nothing published, repository restored) :')
+    lines.add('  Failed (nothing published ; error lines and rollback above) :')
     failed.each { coords, reason -> lines.add("    - ${coords} : ${reason}".toString()) }
     lines.add(isDryRun() ? '  Would be published (in Nexus, referenced by the aggregate POM) :' : '  Published (in Nexus, referenced by the aggregate POM) :')
     if (released.isEmpty()) {
