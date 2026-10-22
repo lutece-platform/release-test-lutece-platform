@@ -65,6 +65,17 @@
         <lutece.plugin-testreleasegitlab.version>2.2.8-beta-02</lutece.plugin-testreleasegitlab.version>
     </properties>
 
+    <!-- Test fixture: module-testrelease pulls plugin-testrelease [0.0.1,), pinned to a core 7 release -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>plugin-testrelease</artifactId>
+                <version>3.0.4</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
     <build>
         <defaultGoal>package</defaultGoal>
         <plugins>
