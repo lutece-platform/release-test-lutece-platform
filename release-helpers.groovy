@@ -241,6 +241,28 @@ def resolveMasterBranch() {
 }
 
 /**
+ * Commit id of a branch on the remote, empty when the branch does not exist.
+ */
+def remoteBranchHead(String branch) {
+    return sh(script: "git ls-remote --heads origin '${branch}' | cut -f1", returnStdout: true).trim()
+}
+
+/**
+ * Fails at initialization when a stable release of all the modules targets a
+ * MASTER_BRANCH missing on the remote : nothing is tagged nor deployed yet.
+ */
+def validateMasterBranch() {
+    def master = env.MASTER_BRANCH
+    if (env.IS_PRERELEASE == 'true' || !master || isSingleModuleRelease()) {
+        return
+    }
+    if (!remoteBranchHead(master)) {
+        error("Branch ${master} does not exist on the remote : create it (or fix MASTER_BRANCH) before releasing.")
+    }
+    echo "Master branch        : ${master} (found on the remote)"
+}
+
+/**
  * Determines the branch the workspace actually holds.
  *
  * Jenkins checks out a detached SHA, so `git rev-parse --abbrev-ref HEAD`
@@ -566,14 +588,47 @@ def releaseStarter(String starterName) {
         return
     }
 
-    // Build the module and its reactor dependencies (install only), then deploy ONLY the target module.
-    // Using -am with deploy would re-deploy already-published dependencies -> Nexus 400 Bad Request.
-    withJdk(env.PLATFORM_TARGET_JDK) {
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean install -pl ${starterName} -am -DskipTests -DperformRelease=true"
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true"
-    }
+    buildStarters([starterName])
+    deployStarter(starterName)
 
     echo "Released ${starterName} ${moduleVersion} successfully."
+}
+
+/**
+ * Builds the given modules and their reactor dependencies in ONE Maven
+ * invocation (install only, no deploy).
+ *
+ * Never call this from inside a parallel block: with -am every invocation
+ * rebuilds release-test-lutece-parent, and concurrent 'clean' / 'flatten:clean' runs on the
+ * shared workspace delete the root .flattened-pom.xml while another build is
+ * installing it ("The POM for project release-test-lutece-parent could not be attached").
+ */
+def buildStarters(List<String> modules) {
+    if (params.DRY_RUN) {
+        echo "[DRY-RUN] Would build ${modules.join(',')} with JDK ${env.PLATFORM_TARGET_JDK ?: '(build default)'}"
+        return
+    }
+
+    withJdk(env.PLATFORM_TARGET_JDK) {
+        sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean install -pl ${modules.join(',')} -am -DskipTests -DperformRelease=true"
+    }
+}
+
+/**
+ * Deploys ONLY the given module, already built by buildStarters().
+ * Using -am with deploy would re-deploy already-published dependencies -> Nexus 400 Bad Request.
+ * Safe to run in parallel for distinct modules: no clean, and each one only
+ * touches its own directory.
+ */
+def deployStarter(String starterName) {
+    if (params.DRY_RUN) {
+        echo "[DRY-RUN] Would deploy ${starterName}:${getModuleReleaseVersion(starterName)} to Nexus"
+        return
+    }
+
+    withJdk(env.PLATFORM_TARGET_JDK) {
+        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true"
+    }
 }
 
 /**
@@ -698,6 +753,7 @@ def stageInitialize() {
     }
     writeAskpassScript()
     sh 'git remote set-url origin https://github.com/lutece-platform/release-test-lutece-platform.git'
+    validateMasterBranch()
 
     def pomContent = readFile('pom.xml')
     def currentVersion
@@ -994,7 +1050,7 @@ def stagePromoteToMaster() {
         echo "Single-module release: ${master} is not touched (other modules may still be in SNAPSHOT)"
         return
     }
-    def remoteMaster = sh(script: "git ls-remote --heads origin '${master}' | cut -f1", returnStdout: true).trim()
+    def remoteMaster = remoteBranchHead(master)
     if (!remoteMaster) {
         error("Branch ${master} does not exist on the remote : create it (or fix MASTER_BRANCH) before promoting the release.")
     }
@@ -1020,12 +1076,30 @@ def stageReleaseSpecializedStarters() {
     def starters = env.STARTERS_TO_RELEASE.split(',').collect { it.trim() }.findAll { it }
     def specializedStarters = starters.findAll { it in ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter'] }
 
+    // Build all of them once, sequentially, before going parallel (see buildStarters).
+    // A build failure stops the stage before any deploy: no starter reaches Nexus alone.
+    try {
+        buildStarters(specializedStarters)
+    } catch (Throwable e) {
+        appendReport("FAILED Build: ${specializedStarters.join(', ')} — ${e.message}")
+        appendReport("  -> Aucun starter n'a ete deploye sur Nexus")
+        try {
+            rollbackTags()
+            appendReport("ROLLBACK OK: tag(s) ${env.RELEASE_TAGS}")
+        } catch (Throwable re) {
+            appendReport("ROLLBACK FAILED: tag(s) ${env.RELEASE_TAGS} — manual intervention required: ${re.message}")
+        }
+        error("Failed to build specialized starters: ${e.message}")
+    }
+
     def parallelSteps = [:]
     specializedStarters.each { starter ->
         parallelSteps[starter] = {
             def starterVersion = getModuleReleaseVersion(starter)
             try {
-                releaseStarter(starter)
+                echo "=== Releasing ${starter} ${starterVersion} ==="
+                deployStarter(starter)
+                echo "Released ${starter} ${starterVersion} successfully."
                 appendReport("Starter Released: ${starter} ${starterVersion}")
             } catch (Throwable e) {
                 appendReport("FAILED Starter: ${starter} — ${e.message}")

@@ -43,7 +43,7 @@ pipeline {
     // steps. The JDK that actually compiles and deploys each artifact is picked
     // at runtime from the POM's targetJdk (see helpers.withJdk / JDK_TOOL_MAP).
     tools {
-        maven 'Maven 3.8.5'
+        maven 'maven-3.9.12'
         jdk 'temurin-17-jdk'
     }
 
