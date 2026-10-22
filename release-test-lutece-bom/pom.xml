@@ -4,7 +4,7 @@
     <parent>
         <groupId>fr.paris.lutece.starters</groupId>
         <artifactId>release-test-lutece-parent</artifactId>
-        <version>7.2.0-beta-01</version>
+        <version>7.2.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>release-test-lutece-bom</artifactId>
