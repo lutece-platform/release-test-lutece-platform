@@ -592,8 +592,6 @@ def releaseTags() {
 def deployModules(List<String> modules) {
     sh "git checkout --quiet --detach ${releaseTags()[0]}"
     try {
-        // Temporary, rollback test (B2): remove after the test
-        error('Deploy failure simulated for the rollback test')
         withJdk(env.PLATFORM_TARGET_JDK) {
             // Test platform only: never publish the release-test-* artifacts to the Lutece Nexus
             sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${modules.join(',')} -DskipTests -DperformRelease=true -DdeployAtEnd=true -Dmaven.deploy.skip=true"
