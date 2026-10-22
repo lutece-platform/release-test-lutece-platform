@@ -9,7 +9,7 @@
 
     <groupId>fr.paris.lutece.starters</groupId>
     <artifactId>release-test-lutece-parent</artifactId>
-    <version>7.2.0-beta-02</version>
+    <version>7.2.0-SNAPSHOT</version>
     <packaging>pom</packaging>
     <name>Release test - Lutece platform parent</name>
     <description>Test fixture of the releaser : a copy of the lutece-platform monorepo (same structure, same pipeline) whose starters aggregate test components only</description>
@@ -44,11 +44,11 @@
         <maven.deploy.skip>${parent.deploy.skip}</maven.deploy.skip>
 
         <!-- LUTECE PROFILES VERSION — each starter/BOM has its own version for independent releases -->
-        <lutece.release-test-forms-starter.version>7.2.0-beta-02</lutece.release-test-forms-starter.version>
-        <lutece.release-test-appointment-starter.version>7.2.0-beta-02</lutece.release-test-appointment-starter.version>
-        <lutece.release-test-editorial-starter.version>7.2.0-beta-02</lutece.release-test-editorial-starter.version>
-        <lutece.release-test-lutece-starter.version>7.2.0-beta-02</lutece.release-test-lutece-starter.version>
-        <lutece.release-test-lutece-bom.version>7.2.0-beta-02</lutece.release-test-lutece-bom.version>
+        <lutece.release-test-forms-starter.version>7.2.0-SNAPSHOT</lutece.release-test-forms-starter.version>
+        <lutece.release-test-appointment-starter.version>7.2.0-SNAPSHOT</lutece.release-test-appointment-starter.version>
+        <lutece.release-test-editorial-starter.version>7.2.0-SNAPSHOT</lutece.release-test-editorial-starter.version>
+        <lutece.release-test-lutece-starter.version>7.2.0-SNAPSHOT</lutece.release-test-lutece-starter.version>
+        <lutece.release-test-lutece-bom.version>7.2.0-SNAPSHOT</lutece.release-test-lutece-bom.version>
 
         <!-- Lutece core (real, released : exercises the "core" -> "lutece-core" alias of the releaser) -->
         <lutece.core.version>7.1.10-beta-03</lutece.core.version>
