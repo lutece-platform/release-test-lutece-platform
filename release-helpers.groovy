@@ -1042,7 +1042,7 @@ def stageBuild() {
         appendReport("  -> Nothing was pushed nor deployed : relaunch once fixed")
         error("Failed to build ${modules.join(', ')}: ${e.message}")
     }
-    appendReport("Built: ${modules.join(', ')}")
+    appendReport("${params.DRY_RUN ? 'Build (dry-run)' : 'Built'}: ${modules.join(', ')}")
 }
 
 /**
