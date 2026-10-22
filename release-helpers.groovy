@@ -639,7 +639,7 @@ def rollbackPublication() {
     }
 
     releaseTags().each { tag ->
-        complete &= rollbackStep("tag ${tag}", "git push origin :refs/tags/${tag}")
+        complete &= rollbackStep("tag ${tag}", "git push origin :refs/tags/${tag} && git tag -d ${tag}")
     }
 
     appendReport(complete ? "ROLLBACK OK : the remote is back in its state before the release" :
@@ -932,7 +932,7 @@ def stageValidateReleaseReadiness() {
             appendReport("  -> ALLOW_SNAPSHOT_DEPENDENCIES=true : publication malgre les violations")
             unstable("${violations.size()} plugin dependencies are still SNAPSHOT — published anyway (ALLOW_SNAPSHOT_DEPENDENCIES=true)")
         } else {
-            error("""${violations.size()} plugin dependencies are still SNAPSHOT. Nothing was tagged or deployed.
+            error("""${violations.size()} plugin dependencies are still SNAPSHOT. Nothing was pushed, tagged or deployed.
 
 Releasing a starter that depends on a SNAPSHOT publishes an artifact whose
 content keeps changing under its consumers. The full list is in the archived
