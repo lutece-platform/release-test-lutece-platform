@@ -562,46 +562,9 @@ def parseSnapshotPlugins(String pomContent) {
 }
 
 /**
- * Builds and deploys a starter or BOM module of this monorepo to Nexus.
- *
- * Tagging (stage 'Tag Release') and the master merge (stage 'Promote to
- * master') are deliberately NOT done here: this function runs inside parallel
- * stages, and tagging or checking out master concurrently from the same
- * working copy corrupts it.
- *
- * The module is built with the JDK matching the POM's targetJdk, so the same
- * pipeline releases the V7 line (JDK 11) and the V8 line (JDK 17).
- *
- * Master is never touched before deploy succeeds -> simple rollback (tag delete only).
- */
-def releaseStarter(String starterName) {
-    def moduleVersion = getModuleReleaseVersion(starterName)
-    def isPre = env.IS_PRERELEASE == 'true'
-
-    echo "=== Releasing ${starterName} ${moduleVersion}${isPre ? ' (' + prereleaseLabel() + ')' : ''} ==="
-
-    if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would release ${starterName}"
-        echo "[DRY-RUN]   Tag(s) already handled by the 'Tag Release' stage: ${env.RELEASE_TAGS ?: '(not computed)'}"
-        echo "[DRY-RUN]   Build with JDK ${env.PLATFORM_TARGET_JDK ?: '(build default)'}"
-        echo "[DRY-RUN]   Deploy ${starterName}:${moduleVersion} to Nexus"
-        return
-    }
-
-    buildStarters([starterName])
-    deployStarter(starterName)
-
-    echo "Released ${starterName} ${moduleVersion} successfully."
-}
-
-/**
  * Builds the given modules and their reactor dependencies in ONE Maven
- * invocation (install only, no deploy).
- *
- * Never call this from inside a parallel block: with -am every invocation
- * rebuilds release-test-lutece-parent, and concurrent 'clean' / 'flatten:clean' runs on the
- * shared workspace delete the root .flattened-pom.xml while another build is
- * installing it ("The POM for project release-test-lutece-parent could not be attached").
+ * invocation (install only, no deploy), with the JDK matching the POM's
+ * targetJdk : the same pipeline releases the V7 line (JDK 11) and the V8 line (JDK 17).
  */
 def buildStarters(List<String> modules) {
     if (params.DRY_RUN) {
@@ -615,75 +578,72 @@ def buildStarters(List<String> modules) {
 }
 
 /**
- * Deploys ONLY the given module, already built by buildStarters().
- * Using -am with deploy would re-deploy already-published dependencies -> Nexus 400 Bad Request.
- * Safe to run in parallel for distinct modules: no clean, and each one only
- * touches its own directory.
+ * Release tag(s) created by the 'Tag Release' stage.
  */
-def deployStarter(String starterName) {
-    if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would deploy ${starterName}:${getModuleReleaseVersion(starterName)} to Nexus"
-        return
-    }
-
-    withJdk(env.PLATFORM_TARGET_JDK) {
-        // Test platform only: never publish the release-test-* artifacts to the Lutece Nexus
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true -Dmaven.deploy.skip=true"
-    }
+def releaseTags() {
+    return env.RELEASE_TAGS ? env.RELEASE_TAGS.split(',').collect { it.trim() }.findAll { it } : []
 }
 
 /**
- * Rolls back a failed starter release within the monorepo.
- *
- * Master is never touched before deploy succeeds, so rollback is simple:
- * - Delete the release tag(s) (local + remote)
- * - Ensure we are back on the release branch
+ * Deploys the given modules, already built by buildStarters(), from the
+ * release tag, in ONE Maven invocation : with deployAtEnd nothing reaches
+ * Nexus until every module is built. No -am : it would re-deploy release-test-lutece-parent.
  */
-def rollbackStarter(String starterName) {
-    echo "=== Rolling back ${starterName} ==="
-
-    if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would rollback ${starterName}"
-        return
-    }
-
-    // The release tag(s) are created once by the 'Tag Release' stage, so the
-    // rollback deletes those — not a per-module tag that no longer exists.
-    rollbackTags()
-
-    // Ensure we are back on the release branch
+def deployModules(List<String> modules) {
+    sh "git checkout --quiet --detach ${releaseTags()[0]}"
     try {
-        sh "git checkout ${env.MONOREPO_BRANCH}"
-    } catch (Throwable e) {
-        echo "WARNING: Could not checkout ${env.MONOREPO_BRANCH}: ${e.message}"
+        withJdk(env.PLATFORM_TARGET_JDK) {
+            // Test platform only: never publish the release-test-* artifacts to the Lutece Nexus
+            sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${modules.join(',')} -DskipTests -DperformRelease=true -DdeployAtEnd=true -Dmaven.deploy.skip=true"
+        }
+    } finally {
+        sh "git checkout --quiet ${env.MONOREPO_BRANCH}"
     }
 }
 
 /**
- * Deletes the release tag(s) created by the 'Tag Release' stage, locally and
- * on the remote. Safe to call more than once.
+ * Runs one rollback action and writes its result in the report.
+ * Returns false when the action failed.
  */
-def rollbackTags() {
-    def tags = env.RELEASE_TAGS ? env.RELEASE_TAGS.split(',').collect { it.trim() }.findAll { it } : []
-    if (!tags) {
-        echo "No release tag to roll back"
-        return
+def rollbackStep(String label, String command) {
+    try {
+        sh command
+        appendReport("  ${label} : rolled back")
+        return true
+    } catch (Throwable e) {
+        appendReport("  ${label} : INCOMPLETE ROLLBACK, fix by hand (${e.message})")
+        return false
+    }
+}
+
+/**
+ * Puts the remote back in its state before the release, after a failed
+ * deploy : release branch and MASTER_BRANCH forced back to the commits read at
+ * initialization (only if they still hold what this build pushed), tags
+ * deleted. Every action is tried even if the previous one failed.
+ */
+def rollbackPublication() {
+    appendReport("ROLLBACK :")
+    def complete = true
+
+    def branch = env.MONOREPO_BRANCH
+    def pushed = sh(script: "git rev-parse refs/heads/${branch}", returnStdout: true).trim()
+    complete &= rollbackStep("branch ${branch} -> ${env.BRANCH_HEAD_BEFORE}",
+            "git push --force-with-lease=refs/heads/${branch}:${pushed} origin ${env.BRANCH_HEAD_BEFORE}:refs/heads/${branch}")
+
+    if (env.MASTER_MERGED == 'true') {
+        def master = env.MASTER_BRANCH
+        def pushedMaster = sh(script: "git rev-parse refs/heads/${master}", returnStdout: true).trim()
+        complete &= rollbackStep("branch ${master} -> ${env.MASTER_HEAD_BEFORE}",
+                "git push --force-with-lease=refs/heads/${master}:${pushedMaster} origin ${env.MASTER_HEAD_BEFORE}:refs/heads/${master}")
     }
 
-    if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would delete tag(s): ${tags.join(', ')}"
-        return
+    releaseTags().each { tag ->
+        complete &= rollbackStep("tag ${tag}", "git push origin :refs/tags/${tag}")
     }
 
-    tags.each { tag ->
-        try {
-            sh "git tag -d ${tag} || true"
-            sh "git push origin :refs/tags/${tag} || true"
-            echo "Deleted tag ${tag}"
-        } catch (Throwable e) {
-            echo "WARNING: Could not delete tag ${tag}: ${e.message}"
-        }
-    }
+    appendReport(complete ? "ROLLBACK OK : the remote is back in its state before the release" :
+            "INCOMPLETE ROLLBACK : fix by hand the lines above")
 }
 
 /**
@@ -755,6 +715,9 @@ def stageInitialize() {
     writeAskpassScript()
     sh 'git remote set-url origin https://github.com/lutece-platform/release-test-lutece-platform.git'
     validateMasterBranch()
+    // Remote commits restored by rollbackPublication() if the publication fails
+    env.BRANCH_HEAD_BEFORE = remoteBranchHead(env.MONOREPO_BRANCH)
+    env.MASTER_HEAD_BEFORE = env.MASTER_BRANCH ? remoteBranchHead(env.MASTER_BRANCH) : ''
 
     def pomContent = readFile('pom.xml')
     def currentVersion
@@ -897,7 +860,6 @@ def _updatePomSingleModule(String pomFile) {
             git add pom.xml
             git diff --cached --quiet && echo 'Version already at ${env.COMPUTED_RELEASE_VERSION} — nothing to commit' || git commit -m "release: update ${params.RELEASE_TARGET} version to ${env.COMPUTED_RELEASE_VERSION}"
         """
-        sh "git push origin ${env.MONOREPO_BRANCH}"
     } else {
         echo "[DRY-RUN] Would update <${versionProp}> to ${env.COMPUTED_RELEASE_VERSION}"
     }
@@ -927,7 +889,6 @@ def _updatePomAllModules(String pomFile) {
             git add pom.xml */pom.xml
             git diff --cached --quiet && echo 'Versions already at release — nothing to commit' || git commit -m "release: update versions for release"
         """
-        sh "git push origin ${env.MONOREPO_BRANCH}"
     } else {
         echo "[DRY-RUN] Would update POM parent and per-module versions:"
         moduleVersions.each { mod, info ->
@@ -991,11 +952,8 @@ Or set ALLOW_SNAPSHOT_DEPENDENCIES=true to publish despite the violations.""")
 }
 
 /**
- * Stage 5b — Create and push the release tag(s) on the monorepo.
- *
- * Tagging is done here, once and before any deploy, rather than inside
- * releaseStarter(): that ran inside the parallel starter stages, tagging and
- * pushing from the same working copy concurrently.
+ * Stage 5b — Create the release tag(s) on the monorepo, locally : the
+ * 'Publish' stage pushes them with the branches.
  *
  * Tag naming:
  *   RELEASE_TARGET = 'all'   -> v8.0.0-beta-01              (platform)
@@ -1008,7 +966,7 @@ def stageTagRelease() {
     echo "Release tag(s): ${tags.join(', ')}"
 
     if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would create and push tag(s): ${tags.join(', ')}"
+        echo "[DRY-RUN] Would create tag(s): ${tags.join(', ')}"
         appendReport("Tags (dry-run): ${tags.join(', ')}")
         return
     }
@@ -1018,21 +976,15 @@ def stageTagRelease() {
         // so drop the local tag before recreating it.
         sh "git tag -d ${tag} 2>/dev/null || true"
         sh "git tag -a ${tag} -m \"Release ${tag}\""
-        // Not forced on purpose: pushing over an existing remote tag must fail
-        // loudly rather than silently overwrite a published release.
-        sh "git push origin ${tag}"
     }
 
-    appendReport("Tags created: ${tags.join(', ')}")
+    appendReport("Tags created (local): ${tags.join(', ')}")
     appendReport('')
 }
 
 /**
- * Stage 8b — Promote the release branch to master.
- *
- * Runs once, after every module has been deployed. This merge used to live in
- * releaseStarter(), which meant the 3 parallel starter jobs each ran
- * `git checkout master && git merge` on the same working copy.
+ * Stage 8b — Merge the release branch into master, locally : the 'Publish'
+ * stage pushes master with the release branch and the tag(s).
  *
  * Pre-releases (beta / RC) never touch master.
  */
@@ -1058,121 +1010,78 @@ def stagePromoteToMaster() {
     if (params.DRY_RUN) {
         echo "[DRY-RUN] Would merge ${env.MONOREPO_BRANCH} into ${master}"
         appendReport("Promotion (dry-run): ${env.MONOREPO_BRANCH} -> ${master}")
+        env.MASTER_MERGED = 'true'
         return
     }
 
     sh "git fetch origin '${master}:${master}' || git branch '${master}' '${remoteMaster}'"
     sh "git checkout '${master}'"
     sh "git merge ${env.MONOREPO_BRANCH} -m \"Merge ${env.MONOREPO_BRANCH} for release ${env.RELEASE_TAGS}\""
-    sh "git push origin '${master}'"
     sh "git checkout ${env.MONOREPO_BRANCH}"
+    env.MASTER_MERGED = 'true'
 
-    appendReport("Promoted to ${master}: ${env.RELEASE_TAGS}")
+    appendReport("Merged into ${master} (local): ${env.RELEASE_TAGS}")
 }
 
 /**
- * Stage 6 — Release specialized starters in parallel.
+ * Modules released by this build, in reactor order.
  */
-def stageReleaseSpecializedStarters() {
-    def starters = env.STARTERS_TO_RELEASE.split(',').collect { it.trim() }.findAll { it }
-    def specializedStarters = starters.findAll { it in ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter'] }
-
-    // Build all of them once, sequentially, before going parallel (see buildStarters).
-    // A build failure stops the stage before any deploy: no starter reaches Nexus alone.
-    try {
-        buildStarters(specializedStarters)
-    } catch (Throwable e) {
-        appendReport("FAILED Build: ${specializedStarters.join(', ')} — ${e.message}")
-        appendReport("  -> Aucun starter n'a ete deploye sur Nexus")
-        try {
-            rollbackTags()
-            appendReport("ROLLBACK OK: tag(s) ${env.RELEASE_TAGS}")
-        } catch (Throwable re) {
-            appendReport("ROLLBACK FAILED: tag(s) ${env.RELEASE_TAGS} — manual intervention required: ${re.message}")
-        }
-        error("Failed to build specialized starters: ${e.message}")
-    }
-
-    def parallelSteps = [:]
-    specializedStarters.each { starter ->
-        parallelSteps[starter] = {
-            def starterVersion = getModuleReleaseVersion(starter)
-            try {
-                echo "=== Releasing ${starter} ${starterVersion} ==="
-                deployStarter(starter)
-                echo "Released ${starter} ${starterVersion} successfully."
-                appendReport("Starter Released: ${starter} ${starterVersion}")
-            } catch (Throwable e) {
-                appendReport("FAILED Starter: ${starter} — ${e.message}")
-                appendReport("  -> Si le tag existe deja : git push origin :refs/tags/${env.RELEASE_TAGS}")
-                appendReport("  -> Si l'artefact est deja sur Nexus : supprimer manuellement depuis l'interface Nexus")
-                appendReport("  -> Puis relancer le build")
-                try {
-                    rollbackStarter(starter)
-                    appendReport("ROLLBACK OK: ${starter}")
-                } catch (Throwable re) {
-                    appendReport("ROLLBACK FAILED: ${starter} — manual intervention required: ${re.message}")
-                }
-                error("Failed to release ${starter}: ${e.message}")
-            }
-        }
-    }
-    parallel parallelSteps
+def modulesToRelease() {
+    return env.STARTERS_TO_RELEASE.split(',').collect { it.trim() }.findAll { it }
 }
 
 /**
- * Stage 7 — Release release-test-lutece-starter.
+ * Stage 6 — Build every module to release, locally, before anything is pushed.
  */
-def stageReleaseLuteceStarter() {
-    echo "Validating specialized starters are in release version before releasing release-test-lutece-starter..."
-
-    def luteceStarterPom = readFile('release-test-lutece-starter/pom.xml')
-    def starterRefs = ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter']
-    starterRefs.each { ref ->
-        if (luteceStarterPom.contains('SNAPSHOT') && luteceStarterPom.contains(ref)) {
-            echo "Note: ${ref} version resolved via \${lutece.${ref}.version} parent property"
-        }
-    }
-
-    def lsVersion = getModuleReleaseVersion('release-test-lutece-starter')
+def stageBuild() {
+    def modules = modulesToRelease()
     try {
-        releaseStarter('release-test-lutece-starter')
-        appendReport("Starter Released: release-test-lutece-starter ${lsVersion}")
+        buildStarters(modules)
     } catch (Throwable e) {
-        appendReport("FAILED Starter: release-test-lutece-starter — ${e.message}")
-        appendReport("  -> Si le tag existe deja : git push origin :refs/tags/${env.RELEASE_TAGS}")
-        appendReport("  -> Si l'artefact est deja sur Nexus : supprimer manuellement depuis l'interface Nexus")
-        appendReport("  -> Puis relancer le build")
-        try {
-            rollbackStarter('release-test-lutece-starter')
-            appendReport("ROLLBACK OK: release-test-lutece-starter")
-        } catch (Throwable re) {
-            appendReport("ROLLBACK FAILED: release-test-lutece-starter — manual intervention required: ${re.message}")
-        }
-        error("Failed to release release-test-lutece-starter: ${e.message}")
+        appendReport("FAILED Build: ${modules.join(', ')} — ${e.message}")
+        appendReport("  -> Nothing was pushed nor deployed : relaunch once fixed")
+        error("Failed to build ${modules.join(', ')}: ${e.message}")
     }
+    appendReport("Built: ${modules.join(', ')}")
 }
 
 /**
- * Stage 8 — Release release-test-lutece-bom.
+ * Stage 10 — Publish : push the release branch, the tag(s) and master in one
+ * atomic push (all or nothing), then deploy to Nexus from the tag. A failed
+ * deploy puts the remote back in its state before the release.
  */
-def stageReleaseBom() {
-    def bomVersion = getModuleReleaseVersion('release-test-lutece-bom')
+def stagePublish() {
+    def modules = modulesToRelease()
+    def refs = [env.MONOREPO_BRANCH] + releaseTags().collect { "refs/tags/${it}".toString() }
+    if (env.MASTER_MERGED == 'true') {
+        refs << env.MASTER_BRANCH
+    }
+
+    if (params.DRY_RUN) {
+        echo "[DRY-RUN] Would push ${refs.join(' ')} (atomic), then deploy ${modules.join(',')} from ${releaseTags().join(', ')}"
+        appendReport("Publish (dry-run): ${refs.join(', ')} ; deploy ${modules.join(', ')}")
+        return
+    }
+
     try {
-        releaseStarter('release-test-lutece-bom')
-        appendReport("BOM Released: release-test-lutece-bom ${bomVersion}")
+        sh "git push --atomic origin ${refs.join(' ')}"
     } catch (Throwable e) {
-        appendReport("FAILED: release-test-lutece-bom — ${e.message}")
-        appendReport("  -> Si le tag existe deja : git push origin :refs/tags/${env.RELEASE_TAGS}")
-        appendReport("  -> Si l'artefact est deja sur Nexus : supprimer manuellement depuis l'interface Nexus")
-        appendReport("  -> Puis relancer le build")
-        try {
-            rollbackStarter('release-test-lutece-bom')
-            appendReport("ROLLBACK OK: release-test-lutece-bom")
-        } catch (Throwable re) {
-            appendReport("ROLLBACK FAILED: release-test-lutece-bom — manual intervention required: ${re.message}")
-        }
-        error("Failed to release release-test-lutece-bom: ${e.message}")
+        appendReport("FAILED Push: ${e.message}")
+        appendReport("  -> Atomic push : nothing was pushed nor deployed")
+        error("Failed to push ${refs.join(' ')}: ${e.message}")
+    }
+    appendReport("Pushed: ${refs.join(', ')}")
+
+    try {
+        deployModules(modules)
+    } catch (Throwable e) {
+        appendReport("FAILED Deploy: ${modules.join(', ')} — ${e.message}")
+        appendReport("  -> Artifacts already on Nexus, if any, must be removed by hand before relaunching")
+        rollbackPublication()
+        error("Failed to deploy ${modules.join(', ')}: ${e.message}")
+    }
+    modules.each { mod ->
+        appendReport("Released: ${mod} ${getModuleReleaseVersion(mod)}")
     }
 }
 
@@ -1231,7 +1140,6 @@ def _nextSnapshotSingleModule(boolean isPre) {
     sh """
         git add pom.xml
         git diff --cached --quiet && echo 'Version already at target — nothing to commit' || git commit -m "${commitMsg}"
-        git push origin ${env.MONOREPO_BRANCH}
     """
 }
 
@@ -1263,7 +1171,6 @@ def _nextSnapshotAllModules(boolean isPre) {
     sh """
         git add pom.xml */pom.xml
         git diff --cached --quiet && echo 'Versions already at target — nothing to commit' || git commit -m "${commitMsg}"
-        git push origin ${env.MONOREPO_BRANCH}
     """
 }
 

@@ -170,45 +170,16 @@ pipeline {
             }
         }
 
+        // Git stays local until 'Publish' : a failure before it leaves nothing to undo
+        stage('Build') {
+            steps {
+                script { helpers.stageBuild() }
+            }
+        }
+
         stage('Tag Release') {
             steps {
                 script { helpers.stageTagRelease() }
-            }
-        }
-
-        stage('Release Specialized Starters') {
-            when {
-                expression {
-                    def starters = env.STARTERS_TO_RELEASE?.split(',')?.collect { it.trim() }?.findAll { it } ?: []
-                    return starters.any { it in ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter'] }
-                }
-            }
-            steps {
-                script { helpers.stageReleaseSpecializedStarters() }
-            }
-        }
-
-        stage('Release release-test-lutece-starter') {
-            when {
-                expression {
-                    def starters = env.STARTERS_TO_RELEASE?.split(',')?.collect { it.trim() }?.findAll { it } ?: []
-                    return starters.contains('release-test-lutece-starter')
-                }
-            }
-            steps {
-                script { helpers.stageReleaseLuteceStarter() }
-            }
-        }
-
-        stage('Release release-test-lutece-bom') {
-            when {
-                expression {
-                    def starters = env.STARTERS_TO_RELEASE?.split(',')?.collect { it.trim() }?.findAll { it } ?: []
-                    return starters.contains('release-test-lutece-bom') || params.RELEASE_TARGET == 'all'
-                }
-            }
-            steps {
-                script { helpers.stageReleaseBom() }
             }
         }
 
@@ -224,6 +195,12 @@ pipeline {
         stage('Prepare Next SNAPSHOT') {
             steps {
                 script { helpers.stagePrepareNextSnapshot() }
+            }
+        }
+
+        stage('Publish') {
+            steps {
+                script { helpers.stagePublish() }
             }
         }
 
