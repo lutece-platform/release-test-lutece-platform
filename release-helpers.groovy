@@ -627,7 +627,8 @@ def deployStarter(String starterName) {
     }
 
     withJdk(env.PLATFORM_TARGET_JDK) {
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true"
+        // Test platform only: never publish the release-test-* artifacts to the Lutece Nexus
+        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true -Dmaven.deploy.skip=true"
     }
 }
 
