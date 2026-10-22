@@ -49,8 +49,8 @@ def padPrereleaseNumber(String raw) {
  *   rc   -> 8.0.0-RC-01
  */
 def qualifyVersion(String base) {
-    def type = env.PRERELEASE_TYPE ?: 'none'
-    if (type == 'none') {
+    def type = env.PRERELEASE_TYPE ?: 'stable'
+    if (type == 'stable') {
         return base
     }
     def qualifier = (type == 'rc') ? 'RC' : type
@@ -69,11 +69,25 @@ def stripQualifier(String version) {
 }
 
 /**
+ * Writes the script git calls for a username or a password : it answers with the GITHUB_LOGIN and GITHUB_TOKEN build parameters, read
+ * from the environment. The token thus never appears in a command line, a URL or the clone configuration ; GIT_ASKPASS points to this script.
+ */
+def writeAskpassScript() {
+    writeFile file: env.GIT_ASKPASS, text: '''#!/bin/sh
+case "$1" in
+  Username*) printf '%s\\n' "$GITHUB_LOGIN" ;;
+  *)         printf '%s\\n' "$GITHUB_TOKEN" ;;
+esac
+'''
+    sh "chmod 700 '${env.GIT_ASKPASS}'"
+}
+
+/**
  * Human-readable label for the current build type, used in logs and reports.
  */
 def prereleaseLabel() {
-    def type = env.PRERELEASE_TYPE ?: 'none'
-    if (type == 'none') {
+    def type = env.PRERELEASE_TYPE ?: 'stable'
+    if (type == 'stable') {
         return 'Stable'
     }
     if (type == 'rc') {
@@ -213,6 +227,39 @@ in the job's SCM — otherwise the release would be pushed to the wrong branch."
     }
 
     return checkedOut
+}
+
+/**
+ * Branch a stable release is promoted to : MASTER_BRANCH, empty = no promotion.
+ * The releaser derives it from the release branch (master for develop,
+ * master_core7 for develop_core7) and sends it empty when the release branch
+ * has no master counterpart, like the classic component release which then
+ * skips the merge back. A manual build keeps the parameter default (master).
+ */
+def resolveMasterBranch() {
+    return params.MASTER_BRANCH?.trim() ?: ''
+}
+
+/**
+ * Commit id of a branch on the remote, empty when the branch does not exist.
+ */
+def remoteBranchHead(String branch) {
+    return sh(script: "git ls-remote --heads origin '${branch}' | cut -f1", returnStdout: true).trim()
+}
+
+/**
+ * Fails at initialization when a stable release of all the modules targets a
+ * MASTER_BRANCH missing on the remote : nothing is tagged nor deployed yet.
+ */
+def validateMasterBranch() {
+    def master = env.MASTER_BRANCH
+    if (env.IS_PRERELEASE == 'true' || !master || isSingleModuleRelease()) {
+        return
+    }
+    if (!remoteBranchHead(master)) {
+        error("Branch ${master} does not exist on the remote : create it (or fix MASTER_BRANCH) before releasing.")
+    }
+    echo "Master branch        : ${master} (found on the remote)"
 }
 
 /**
@@ -541,14 +588,47 @@ def releaseStarter(String starterName) {
         return
     }
 
-    // Build the module and its reactor dependencies (install only), then deploy ONLY the target module.
-    // Using -am with deploy would re-deploy already-published dependencies -> Nexus 400 Bad Request.
-    withJdk(env.PLATFORM_TARGET_JDK) {
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean install -pl ${starterName} -am -DskipTests -DperformRelease=true"
-        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true"
-    }
+    buildStarters([starterName])
+    deployStarter(starterName)
 
     echo "Released ${starterName} ${moduleVersion} successfully."
+}
+
+/**
+ * Builds the given modules and their reactor dependencies in ONE Maven
+ * invocation (install only, no deploy).
+ *
+ * Never call this from inside a parallel block: with -am every invocation
+ * rebuilds release-test-lutece-parent, and concurrent 'clean' / 'flatten:clean' runs on the
+ * shared workspace delete the root .flattened-pom.xml while another build is
+ * installing it ("The POM for project release-test-lutece-parent could not be attached").
+ */
+def buildStarters(List<String> modules) {
+    if (params.DRY_RUN) {
+        echo "[DRY-RUN] Would build ${modules.join(',')} with JDK ${env.PLATFORM_TARGET_JDK ?: '(build default)'}"
+        return
+    }
+
+    withJdk(env.PLATFORM_TARGET_JDK) {
+        sh "mvn -s ${env.MAVEN_SETTINGS_XML} clean install -pl ${modules.join(',')} -am -DskipTests -DperformRelease=true"
+    }
+}
+
+/**
+ * Deploys ONLY the given module, already built by buildStarters().
+ * Using -am with deploy would re-deploy already-published dependencies -> Nexus 400 Bad Request.
+ * Safe to run in parallel for distinct modules: no clean, and each one only
+ * touches its own directory.
+ */
+def deployStarter(String starterName) {
+    if (params.DRY_RUN) {
+        echo "[DRY-RUN] Would deploy ${starterName}:${getModuleReleaseVersion(starterName)} to Nexus"
+        return
+    }
+
+    withJdk(env.PLATFORM_TARGET_JDK) {
+        sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${starterName} -DskipTests -DperformRelease=true"
+    }
 }
 
 /**
@@ -630,10 +710,13 @@ def generateReleaseReport() {
  * Stage 0 — Initialize: configure git, compute versions, create report.
  */
 def stageInitialize() {
-    // -- Pre-release type: none / beta / rc
+    // -- Release type: stable / beta / rc, mandatory (none = not chosen)
     env.PRERELEASE_TYPE = params.PRERELEASE_TYPE?.trim()?.toLowerCase() ?: 'none'
+    if (!(env.PRERELEASE_TYPE in ['stable', 'beta', 'rc'])) {
+        error("PRERELEASE_TYPE is required: stable, beta or rc (got '${env.PRERELEASE_TYPE}')")
+    }
     env.PRERELEASE_NUM = padPrereleaseNumber(params.PRERELEASE_NUMBER)
-    env.IS_PRERELEASE = (env.PRERELEASE_TYPE != 'none') ? 'true' : 'false'
+    env.IS_PRERELEASE = (env.PRERELEASE_TYPE != 'stable') ? 'true' : 'false'
 
     configFileProvider([configFile(fileId: params.MAVEN_SETTINGS_ID, variable: 'MVN_SETTINGS_TMP')]) {
         sh "cp \${MVN_SETTINGS_TMP} ${WORKSPACE}/maven-settings.xml"
@@ -649,6 +732,7 @@ def stageInitialize() {
     //    develop_core7 and the V8 line on develop.
     env.LUTECE_MAJOR_RESOLVED = detectLuteceMajor()
     env.MONOREPO_BRANCH = resolveMonorepoBranch()
+    env.MASTER_BRANCH = resolveMasterBranch()
     env.PLATFORM_TARGET_JDK = detectTargetJdk()
     env.PLATFORM_JDK_TOOL = jdkToolName(env.PLATFORM_TARGET_JDK)
 
@@ -664,9 +748,12 @@ def stageInitialize() {
 
     sh "git checkout -B ${env.MONOREPO_BRANCH}"
 
-    withCredentials([string(credentialsId: params.GITHUB_CREDENTIAL_ID, variable: 'GITHUB_TOKEN')]) {
-        sh 'git remote set-url origin https://$GITHUB_TOKEN@github.com/lutece-platform/release-test-lutece-platform.git'
+    if (!params.GITHUB_LOGIN?.trim() || !params.GITHUB_TOKEN?.toString()?.trim()) {
+        error('GITHUB_LOGIN and GITHUB_TOKEN are required : the releaser sends the credentials of the person releasing, a manual build must type them.')
     }
+    writeAskpassScript()
+    sh 'git remote set-url origin https://github.com/lutece-platform/release-test-lutece-platform.git'
+    validateMasterBranch()
 
     def pomContent = readFile('pom.xml')
     def currentVersion
@@ -733,7 +820,7 @@ def stageInitialize() {
     echo "Release version      : ${env.COMPUTED_RELEASE_VERSION}"
     echo "Next SNAPSHOT version: ${env.COMPUTED_NEXT_SNAPSHOT}"
     if (env.IS_PRERELEASE == 'true') {
-        echo "${prereleaseLabel()}: master is NOT touched, deploy runs from ${env.MONOREPO_BRANCH}, SNAPSHOT restored afterwards"
+        echo "${prereleaseLabel()}: no master promotion, deploy runs from ${env.MONOREPO_BRANCH}, SNAPSHOT restored afterwards"
     }
 
     env.STARTERS_TO_RELEASE = resolveStartersToRelease(params.RELEASE_TARGET)
@@ -763,6 +850,23 @@ def stageUpdatePomVersions() {
     echo "Updating root pom.xml with release versions..."
     def pomFile = 'pom.xml'
     def singleModule = isSingleModuleRelease()
+
+    def parentVersion = params.PARENT_VERSION?.trim()
+    if (parentVersion) {
+        if (!params.DRY_RUN) {
+            sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${parentVersion}</version>|' ${pomFile}"
+        }
+        appendReport("${params.DRY_RUN ? '[DRY-RUN] Would set' : 'Set'} parent lutece-global-pom version to ${parentVersion}")
+    }
+
+    // lutece.core.version must be the core released by the campaign : set before the readiness validation reads the POM
+    def coreVersion = params.CORE_VERSION?.trim()
+    if (coreVersion) {
+        if (!params.DRY_RUN) {
+            sh "sed -i 's|<lutece.core.version>[^<]*</lutece.core.version>|<lutece.core.version>${coreVersion}</lutece.core.version>|' ${pomFile}"
+        }
+        appendReport("${params.DRY_RUN ? '[DRY-RUN] Would set' : 'Set'} lutece.core.version to ${coreVersion}")
+    }
 
     if (singleModule) {
         _updatePomSingleModule(pomFile)
@@ -932,25 +1036,37 @@ def stageTagRelease() {
  * Pre-releases (beta / RC) never touch master.
  */
 def stagePromoteToMaster() {
+    def master = env.MASTER_BRANCH
     if (env.IS_PRERELEASE == 'true') {
-        echo "${prereleaseLabel()}: master is not touched by a pre-release"
+        echo "${prereleaseLabel()}: no master promotion for a pre-release"
+        return
+    }
+    if (!master) {
+        echo "MASTER_BRANCH is empty: the release branch has no master counterpart, no promotion"
+        appendReport("No promotion: MASTER_BRANCH is empty (release branch without master counterpart)")
         return
     }
     if (isSingleModuleRelease()) {
-        echo "Single-module release: master is not touched (other modules may still be in SNAPSHOT)"
+        echo "Single-module release: ${master} is not touched (other modules may still be in SNAPSHOT)"
         return
+    }
+    def remoteMaster = remoteBranchHead(master)
+    if (!remoteMaster) {
+        error("Branch ${master} does not exist on the remote : create it (or fix MASTER_BRANCH) before promoting the release.")
     }
     if (params.DRY_RUN) {
-        echo "[DRY-RUN] Would merge ${env.MONOREPO_BRANCH} into master"
+        echo "[DRY-RUN] Would merge ${env.MONOREPO_BRANCH} into ${master}"
+        appendReport("Promotion (dry-run): ${env.MONOREPO_BRANCH} -> ${master}")
         return
     }
 
-    sh "git checkout master"
+    sh "git fetch origin '${master}:${master}' || git branch '${master}' '${remoteMaster}'"
+    sh "git checkout '${master}'"
     sh "git merge ${env.MONOREPO_BRANCH} -m \"Merge ${env.MONOREPO_BRANCH} for release ${env.RELEASE_TAGS}\""
-    sh "git push origin master"
+    sh "git push origin '${master}'"
     sh "git checkout ${env.MONOREPO_BRANCH}"
 
-    appendReport("Promoted to master: ${env.RELEASE_TAGS}")
+    appendReport("Promoted to ${master}: ${env.RELEASE_TAGS}")
 }
 
 /**
@@ -960,12 +1076,30 @@ def stageReleaseSpecializedStarters() {
     def starters = env.STARTERS_TO_RELEASE.split(',').collect { it.trim() }.findAll { it }
     def specializedStarters = starters.findAll { it in ['release-test-forms-starter', 'release-test-appointment-starter', 'release-test-editorial-starter'] }
 
+    // Build all of them once, sequentially, before going parallel (see buildStarters).
+    // A build failure stops the stage before any deploy: no starter reaches Nexus alone.
+    try {
+        buildStarters(specializedStarters)
+    } catch (Throwable e) {
+        appendReport("FAILED Build: ${specializedStarters.join(', ')} — ${e.message}")
+        appendReport("  -> Aucun starter n'a ete deploye sur Nexus")
+        try {
+            rollbackTags()
+            appendReport("ROLLBACK OK: tag(s) ${env.RELEASE_TAGS}")
+        } catch (Throwable re) {
+            appendReport("ROLLBACK FAILED: tag(s) ${env.RELEASE_TAGS} — manual intervention required: ${re.message}")
+        }
+        error("Failed to build specialized starters: ${e.message}")
+    }
+
     def parallelSteps = [:]
     specializedStarters.each { starter ->
         parallelSteps[starter] = {
             def starterVersion = getModuleReleaseVersion(starter)
             try {
-                releaseStarter(starter)
+                echo "=== Releasing ${starter} ${starterVersion} ==="
+                deployStarter(starter)
+                echo "Released ${starter} ${starterVersion} successfully."
                 appendReport("Starter Released: ${starter} ${starterVersion}")
             } catch (Throwable e) {
                 appendReport("FAILED Starter: ${starter} — ${e.message}")

@@ -43,7 +43,7 @@ pipeline {
     // steps. The JDK that actually compiles and deploys each artifact is picked
     // at runtime from the POM's targetJdk (see helpers.withJdk / JDK_TOOL_MAP).
     tools {
-        maven 'Maven 3.8.5'
+        maven 'maven-3.9.12'
         jdk 'temurin-17-jdk'
     }
 
@@ -57,6 +57,16 @@ pipeline {
             name: 'RELEASE_VERSION',
             defaultValue: '',
             description: 'Version release (ex: 8.0.0). Vide = auto-calculée depuis la version SNAPSHOT courante.'
+        )
+        string(
+            name: 'PARENT_VERSION',
+            defaultValue: '',
+            description: 'Version du POM parent (lutece-global-pom) a poser dans le pom.xml racine avant la release. Vide = inchangee. Envoyee par le releaser quand la personne a choisi de mettre le parent a jour.'
+        )
+        string(
+            name: 'CORE_VERSION',
+            defaultValue: '',
+            description: 'Version de lutece-core a poser dans la propriete lutece.core.version du pom.xml racine avant la release. Vide = inchangee. Envoyee par le releaser quand la personne a choisi de corriger le POM avec la version releasee a l etape 3.'
         )
         string(
             name: 'NEXT_SNAPSHOT_VERSION',
@@ -75,13 +85,13 @@ pipeline {
         )
         choice(
             name: 'PRERELEASE_TYPE',
-            choices: ['none', 'beta', 'rc'],
-            description: 'Type de release.\nnone = release stable (8.0.0).\nbeta = pre-release beta (8.0.0-beta-01).\nrc = release candidate (8.0.0-RC-01).\nbeta et rc ne mergent pas sur master et restaurent la version SNAPSHOT apres le deploy.'
+            choices: ['none', 'stable', 'beta', 'rc'],
+            description: 'Type de release, obligatoire.\nnone = aucun type choisi : le build s\'arrete a l\'initialisation.\nstable = release stable (8.0.0).\nbeta = pre-release beta (8.0.0-beta-01).\nrc = release candidate (8.0.0-RC-01).\nbeta et rc ne mergent pas sur master et restaurent la version SNAPSHOT apres le deploy.'
         )
         string(
             name: 'PRERELEASE_NUMBER',
             defaultValue: '1',
-            description: 'Numero de la pre-release (1, 2, 3...), complete sur 2 chiffres : 1 -> beta-01. Ignore si PRERELEASE_TYPE = none.'
+            description: 'Numero de la pre-release (1, 2, 3...), complete sur 2 chiffres : 1 -> beta-01. Ignore si PRERELEASE_TYPE = stable.'
         )
         choice(
             name: 'LUTECE_MAJOR',
@@ -94,14 +104,24 @@ pipeline {
             description: 'Branche de release de ce depot. Vide = branche courante si elle est connue (develop, develop_core7, develop_core8), sinon develop pour la V8 et develop_core7 pour la V7.'
         )
         string(
+            name: 'MASTER_BRANCH',
+            defaultValue: 'master',
+            description: 'Branche de promotion d\'une release stable (master pour develop, master_core7 pour develop_core7). Doit exister sur le depot distant, sinon le build echoue avant la promotion.'
+        )
+        string(
             name: 'JDK_TOOL_MAP',
             defaultValue: '',
             description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Vide = convention temurin-{version}-jdk.'
         )
         string(
-            name: 'GITHUB_CREDENTIAL_ID',
-            defaultValue: 'github-token',
-            description: 'ID du credential Jenkins contenant le token GitHub (type: Secret text).'
+            name: 'GITHUB_LOGIN',
+            defaultValue: '',
+            description: 'Login GitHub de la personne qui lance la release (envoye par le releaser).'
+        )
+        password(
+            name: 'GITHUB_TOKEN',
+            defaultValue: '',
+            description: 'Token GitHub de cette personne, avec le droit d\'ecriture sur le depot. Jamais affiche : git le lit par GIT_ASKPASS.'
         )
         string(
             name: 'MAVEN_SETTINGS_ID',
@@ -122,6 +142,9 @@ pipeline {
 
     environment {
         RELEASE_REPORT = "${WORKSPACE}/release-report.txt"
+        // git asks the login and the token to this script, written by the Initialize stage from the build parameters
+        GIT_ASKPASS = "${WORKSPACE}/.git-askpass.sh"
+        GIT_TERMINAL_PROMPT = '0'
     }
 
     stages {
@@ -207,12 +230,15 @@ pipeline {
         stage('Release Report') {
             steps {
                 script { helpers.stageReleaseReport() }
-                archiveArtifacts artifacts: 'release-report.txt', fingerprint: true
             }
         }
     }
 
     post {
+        always {
+            // Archived even on failure so the releaser can read the partial report
+            archiveArtifacts artifacts: 'release-report.txt', fingerprint: true, allowEmptyArchive: true
+        }
         success {
             script { helpers.postSuccess() }
         }
