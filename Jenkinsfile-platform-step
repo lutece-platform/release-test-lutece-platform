@@ -23,7 +23,11 @@
  *    never touched before all its components are released ;
  *  - per resource, everything runs locally first (tests, version, commit, tag)
  *    and is published in one go (push, Nexus deploy, master merge, next snapshot) ;
- *  - dryRun = true : nothing is pushed, deployed or merged.
+ *  - dryRun = true : nothing is pushed, deployed or merged ;
+ *  - mode = VERIFY : every check that needs a build runs on each resource (tests, SNAPSHOT
+ *    artifacts, release profile build, tag), without stopping at the first failure and without
+ *    committing nor pushing anything ; the result goes to verify-report.json. The plan mode
+ *    (RELEASE, DRY_RUN, VERIFY) defaults to the dryRun flag.
  *
  * Stage logic lives in platform-step-helpers.groovy (loaded via load()) to stay
  * under the 64 KB JVM bytecode-per-method limit imposed by Jenkins CPS.
@@ -102,6 +106,7 @@ pipeline {
 
     environment {
         STEP_REPORT = "${WORKSPACE}/step-report.json"
+        VERIFY_REPORT = "${WORKSPACE}/verify-report.json"
         WORK_DIR = "${WORKSPACE}/work"
         // git asks the login and the token to this script, written by the Initialize stage from the build parameters
         GIT_ASKPASS = "${WORKSPACE}/.git-askpass.sh"
@@ -119,7 +124,19 @@ pipeline {
             }
         }
 
+        stage('Verify components') {
+            when {
+                expression { return helpers.isVerify() }
+            }
+            steps {
+                script { helpers.stageVerifyComponents() }
+            }
+        }
+
         stage('Release components') {
+            when {
+                expression { return !helpers.isVerify() }
+            }
             steps {
                 script { helpers.stageReleaseComponents() }
             }
@@ -127,7 +144,7 @@ pipeline {
 
         stage('Update aggregate POM') {
             when {
-                expression { return helpers.hasAggregate() }
+                expression { return helpers.hasAggregate() && !helpers.isVerify() }
             }
             steps {
                 script { helpers.stageUpdateAggregate() }
@@ -136,7 +153,7 @@ pipeline {
 
         stage('Release aggregate') {
             when {
-                expression { return helpers.isAggregateReleased() && !helpers.hasFailures() }
+                expression { return helpers.isAggregateReleased() && !helpers.hasFailures() && !helpers.isVerify() }
             }
             steps {
                 script { helpers.stageReleaseAggregate() }
@@ -153,6 +170,7 @@ pipeline {
     post {
         always {
             archiveArtifacts artifacts: 'step-report.json', allowEmptyArchive: true, fingerprint: true
+            archiveArtifacts artifacts: 'verify-report.json', allowEmptyArchive: true, fingerprint: true
             // Full output of the Maven and git commands of each resource, see helpers.runLogged
             archiveArtifacts artifacts: 'work/logs/*.log', allowEmptyArchive: true
         }

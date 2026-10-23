@@ -34,6 +34,24 @@ def isDryRun() {
 }
 
 /**
+ * Whether the plan asks for a verification : every check that needs a build runs on each resource, nothing is committed nor pushed.
+ */
+def isVerify() {
+    return env.STEP_MODE == 'VERIFY'
+}
+
+/**
+ * Mode of the plan : RELEASE, DRY_RUN or VERIFY. A plan without mode (releaser before the VERIFY mode) is read from its dryRun flag.
+ */
+def planMode(thePlan) {
+    def mode = (thePlan.mode ?: (thePlan.dryRun ? 'DRY_RUN' : 'RELEASE')).toString().toUpperCase()
+    if (!(mode in ['RELEASE', 'DRY_RUN', 'VERIFY'])) {
+        error("Unknown plan mode '${mode}' : RELEASE, DRY_RUN or VERIFY expected.")
+    }
+    return mode
+}
+
+/**
  * Whether the plan carries an aggregate to update.
  */
 def hasAggregate() {
@@ -414,6 +432,19 @@ def remoteBranchSha(String workDir, String scmUrl, String branch) {
  * of the classic release judges it. Runs before any commit, so nothing is to roll back.
  */
 def checkSnapshotDependencies(String workDir, resource) {
+    def problems = snapshotProblems(workDir)
+    if (!problems.isEmpty()) {
+        appendReport("${coordinates(resource)} : release refused, the POM rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
+        error("${coordinates(resource)} rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
+    }
+}
+
+/**
+ * The SNAPSHOT artifacts the POM in a directory declares : its parent, and the dependencies whose declared version is a SNAPSHOT
+ * ("parent x.y.z-SNAPSHOT", "groupId:artifactId:version"). Empty when the POM declares none.
+ */
+def snapshotProblems(String workDir) {
+    def problems = []
     dir(workDir) {
         def parentVersion = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.version -DforceStdout 2>/dev/null | tail -1 || true", returnStdout: true).trim()
         def declared = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null || true", returnStdout: true)
@@ -428,16 +459,32 @@ def checkSnapshotDependencies(String workDir, resource) {
                 }
             }
         }
-        def problems = []
         if (parentVersion.endsWith('-SNAPSHOT')) {
             problems.add("parent ${parentVersion}".toString())
         }
         problems.addAll(snapshots)
-        if (!problems.isEmpty()) {
-            appendReport("${coordinates(resource)} : release refused, the POM rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
-            error("${coordinates(resource)} rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
+    }
+    return problems
+}
+
+/**
+ * Runs the tests of a resource and fails with the failed test classes and the first failure lines. The work tree is then restored.
+ */
+def runTests(String workDir, resource) {
+    dir(workDir) {
+        echo "Running the tests of ${resource.artifactId}"
+        runLogged(resource, 'Tests (mvn test)', "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q")
+        // lutece-global-pom sets testFailureIgnore=true : Maven exits 0 whatever the tests say, the JUnit reports (TEST-*.xml) are the
+        // only truth. antrun_report.xml, written by the Lutece database setup, is not a test report.
+        def failedReports = sh(script: "grep -l -E '<(failure|error)[ >]' target/surefire-reports/TEST-*.xml 2>/dev/null || true", returnStdout: true).trim()
+        if (failedReports) {
+            def failedClasses = failedReports.readLines().collect { it.replaceAll('.*/TEST-', '').replaceAll('\\.xml$', '') }
+            def failures = sh(script: "grep -h -E -o '<(failure|error)[^>]*' target/surefire-reports/TEST-*.xml | cut -c1-300 | head -15 || true", returnStdout: true).trim()
+            echo failures
+            error("${failedClasses.size()} test class(es) failed in ${resource.artifactId} : ${failedClasses.join(', ')}\n${failures}")
         }
     }
+    cleanWorkTree(workDir)
 }
 
 /**
@@ -466,20 +513,7 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}) ==="
 
     if (mustRunTests(resource)) {
-        dir(workDir) {
-            echo "Running the tests of ${resource.artifactId}"
-            runLogged(resource, 'Tests (mvn test)', "mvn -s ${env.MAVEN_SETTINGS_XML} clean lutece:exploded antrun:run -Dlutece-test-hsql test -q")
-            // lutece-global-pom sets testFailureIgnore=true : Maven exits 0 whatever the tests say, the JUnit reports (TEST-*.xml) are the
-            // only truth. antrun_report.xml, written by the Lutece database setup, is not a test report.
-            def failedReports = sh(script: "grep -l -E '<(failure|error)[ >]' target/surefire-reports/TEST-*.xml 2>/dev/null || true", returnStdout: true).trim()
-            if (failedReports) {
-                def failedClasses = failedReports.readLines().collect { it.replaceAll('.*/TEST-', '').replaceAll('\\.xml$', '') }
-                def failures = sh(script: "grep -h -E -o '<(failure|error)[^>]*' target/surefire-reports/TEST-*.xml | cut -c1-300 | head -15 || true", returnStdout: true).trim()
-                echo failures
-                error("${failedClasses.size()} test class(es) failed in ${resource.artifactId} : ${failedClasses.join(', ')}\n${failures}")
-            }
-        }
-        cleanWorkTree(workDir)
+        runTests(workDir, resource)
     }
 
     if (resource.parentVersion && !isAggregate) {
@@ -612,6 +646,189 @@ def rollbackResource(String workDir, resource, String tag, String releaseSha, St
 }
 
 // ========================================================================
+// Verification of the resources — mode VERIFY, nothing committed nor pushed
+// ========================================================================
+
+/**
+ * Writes and archives the verification report, after every verified resource like the step report.
+ */
+def writeVerifyReport(report) {
+    writeJSON file: env.VERIFY_REPORT, json: report, pretty: 2
+    dir(env.WORKSPACE) {
+        archiveArtifacts artifacts: 'verify-report.json', fingerprint: true
+    }
+}
+
+/**
+ * Runs one check and returns its result : OK, or the given failure status (TO_FIX or WARNING) with the error lines. A failed check never
+ * stops the verification of the other checks nor of the other resources.
+ */
+def runCheck(String check, String failureStatus, Closure body) {
+    try {
+        body()
+        return [check: check, status: 'OK', details: '']
+    } catch (Throwable e) {
+        echo "Check '${check}' : ${failureStatus} — ${e.message}"
+        return [check: check, status: failureStatus, details: (e.message ?: e.class.simpleName).toString()]
+    }
+}
+
+/**
+ * Fails when the POM in a directory declares SNAPSHOT artifacts, see snapshotProblems.
+ */
+def checkNoDirectSnapshot(String workDir) {
+    def problems = snapshotProblems(workDir)
+    if (!problems.isEmpty()) {
+        error("The POM rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
+    }
+}
+
+/**
+ * Fails when the resolved dependency tree holds SNAPSHOT artifacts the POM does not declare itself (dependencies of dependencies). Only a
+ * warning : a Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core without any POM declaring one.
+ */
+def checkNoTransitiveSnapshot(String workDir, resource) {
+    def direct = snapshotProblems(workDir) as Set
+    def treeFile = "${workDir}/target/releaser-dependency-tree.txt"
+    dir(workDir) {
+        runLogged(resource, 'Dependency tree (mvn dependency:tree)', "mvn -s ${env.MAVEN_SETTINGS_XML} -q dependency:tree -DoutputFile='${treeFile}' -DappendOutput=true")
+    }
+    def found = [] as Set
+    readFile(treeFile).readLines().each { line ->
+        def m = (line =~ /^[| ]*[+\\]- ([^:\s]+):([^:\s]+):[^\s]*?([^:\s]+-SNAPSHOT)(:[a-z]+)?/)
+        if (m.find()) {
+            def gav = "${m.group(1)}:${m.group(2)}:${m.group(3)}".toString()
+            if (!direct.contains(gav)) {
+                found.add(gav)
+            }
+        }
+    }
+    if (!found.isEmpty()) {
+        error("SNAPSHOT artifacts reached through other dependencies : ${found.join(' ; ')}")
+    }
+}
+
+/**
+ * Fails when the release tag of a resource already exists on its remote : the release would be refused at the push.
+ */
+def checkTagAbsent(String workDir, resource) {
+    def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
+    def sha = ''
+    withRepositoryUrl(resource.scmUrl) { authUrl ->
+        dir(workDir) {
+            sha = sh(script: "git ls-remote \"${authUrl}\" 'refs/tags/${tag}' | cut -f1", returnStdout: true).trim()
+        }
+    }
+    if (sha) {
+        error("Tag ${tag} already exists on the remote (${shortSha(sha)})")
+    }
+}
+
+/**
+ * Verifies one resource as its release would build it, without committing nor pushing anything : clone, tests (plugins and core), versions
+ * set, SNAPSHOT artifacts, compilation and packaging of the release profile, tag. The aggregate is verified on its current POM, which still
+ * references the SNAPSHOT versions of the components of the step : its SNAPSHOT checks are skipped. Returns the status (OK, TO_FIX,
+ * WARNING), the commit verified (head of the branch at clone time) and the result of each check.
+ */
+def verifyResource(resource, boolean isAggregate) {
+    def result = [status: 'OK', version: resource.targetVersion, commit: '', checks: []]
+    if (isAggregate) {
+        result.note = 'verified before the version updates'
+    }
+    echo "=== Verifying ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}) ==="
+    def workDir = null
+    def clone = runCheck('clone', 'TO_FIX') {
+        workDir = cloneResource(resource)
+        result.commit = readFile("${workDir}/.git/releaser-origin-sha").trim()
+    }
+    if (clone.status != 'OK') {
+        result.checks << clone
+    } else {
+        withJdk(detectTargetJdk(workDir)) {
+            if (mustRunTests(resource)) {
+                result.checks << runCheck('tests', 'TO_FIX') { runTests(workDir, resource) }
+                cleanWorkTree(workDir)
+            }
+            def versions = runCheck('versions', 'TO_FIX') {
+                if (resource.parentVersion && !isAggregate) {
+                    setParentVersion(workDir, resource.parentVersion)
+                }
+                if (!isAggregate) {
+                    setResourceVersion(workDir, resource, resource.targetVersion)
+                }
+            }
+            result.checks << versions
+            if (versions.status == 'OK') {
+                if (!isAggregate) {
+                    result.checks << runCheck('snapshot-dependencies', 'TO_FIX') { checkNoDirectSnapshot(workDir) }
+                    result.checks << runCheck('transitive-snapshot-dependencies', 'WARNING') { checkNoTransitiveSnapshot(workDir, resource) }
+                }
+                result.checks << runCheck('build', 'TO_FIX') {
+                    dir(workDir) {
+                        runLogged(resource, 'Build of the release profile, nothing pushed (mvn clean verify)', "mvn -s ${env.MAVEN_SETTINGS_XML} -q clean verify -DperformRelease=true -DskipTests")
+                    }
+                }
+            }
+            result.checks << runCheck('tag', 'TO_FIX') { checkTagAbsent(workDir, resource) }
+        }
+        cleanWorkTree(workDir)
+    }
+    def statuses = result.checks.collect { it.status }
+    result.status = statuses.contains('TO_FIX') ? 'TO_FIX' : (statuses.contains('WARNING') ? 'WARNING' : 'OK')
+    return result
+}
+
+/**
+ * Writes the result of a verified resource in the step report : one line, then the first lines of each check that did not pass.
+ */
+def reportVerification(resource, result) {
+    def line = "${result.status == 'OK' ? 'VERIFIED' : (result.status == 'TO_FIX' ? 'TO FIX' : 'WARNING')} ${coordinates(resource)} ${resource.targetVersion}" +
+            (result.commit ? " (commit ${shortSha(result.commit)})" : '') + (result.note ? " — ${result.note}" : '')
+    def details = result.checks.findAll { it.status != 'OK' }.collect { check ->
+        def lines = check.details.readLines().findAll { it.trim() }
+        "  - ${check.check} : ${lines ? lines[0] : ''}\n" + formatDetails(lines).readLines().take(15).collect { "  ${it}\n" }.join('')
+    }.join('')
+    appendReport((line + '\n' + details).trim())
+}
+
+/**
+ * Stage 2 (mode VERIFY) — Verify the components, then the aggregate, the verification report growing after each one.
+ */
+def stageVerifyComponents() {
+    def thePlan = plan()
+    def report = [mode: 'VERIFY', components: [:], aggregate: null]
+    writeVerifyReport(report)
+    thePlan.components.each { component ->
+        def result = verifyResource(component, false)
+        report.components[coordinates(component)] = result
+        writeVerifyReport(report)
+        reportVerification(component, result)
+    }
+    if (thePlan.aggregate) {
+        def result = verifyResource(thePlan.aggregate, true)
+        result.coordinates = coordinates(thePlan.aggregate)
+        report.aggregate = result
+        writeVerifyReport(report)
+        reportVerification(thePlan.aggregate, result)
+    }
+}
+
+/**
+ * Final report of a verification : the count of each status. The build is UNSTABLE when a resource is to fix or has a warning : the
+ * verification itself ran, the resources have problems.
+ */
+def reportVerificationSummary() {
+    def report = readJSON(file: env.VERIFY_REPORT, returnPojo: true)
+    def results = report.components.values() + (report.aggregate ? [report.aggregate] : [])
+    def toFix = results.count { it.status == 'TO_FIX' }
+    def warnings = results.count { it.status == 'WARNING' }
+    appendReport("Verification completed : ${toFix} to fix, ${warnings} with a warning, out of ${results.size()} resource(s). Nothing was committed nor pushed.")
+    if (toFix > 0 || warnings > 0) {
+        unstable("${toFix} resource(s) to fix, ${warnings} with a warning")
+    }
+}
+
+// ========================================================================
 // POM updates of the aggregate — the releaser decides, the pipeline applies
 // ========================================================================
 
@@ -676,7 +893,8 @@ def stageInitialize() {
         error('RELEASE_PLAN is not a step plan : stepCode and components are required.')
     }
     env.PLAN_JSON = params.RELEASE_PLAN
-    env.DRY_RUN = thePlan.dryRun ? 'true' : 'false'
+    env.STEP_MODE = planMode(thePlan)
+    env.DRY_RUN = env.STEP_MODE == 'DRY_RUN' ? 'true' : 'false'
     checkCredentials(thePlan)
     writeAskpassScript()
 
@@ -693,11 +911,11 @@ def stageInitialize() {
     echo " Campaign    : #${thePlan.campaignId} ${thePlan.campaignName}"
     echo " Step        : ${thePlan.step} ${thePlan.stepCode}"
     echo " Type        : ${thePlan.releaseType} (core ${thePlan.coreMajor})"
-    echo " Dry-Run     : ${env.DRY_RUN}"
+    echo " Mode        : ${env.STEP_MODE}"
     echo " Components  : ${thePlan.components.size()}"
     echo " Aggregate   : ${thePlan.aggregate ? coordinates(thePlan.aggregate) + ' ' + thePlan.aggregate.currentVersion + ' -> ' + thePlan.aggregate.targetVersion : '(none)'}"
     echo "=========================================="
-    appendReport("Step ${thePlan.step} ${thePlan.stepCode} of campaign #${thePlan.campaignId} ${thePlan.campaignName} — ${thePlan.releaseType} — dry run : ${env.DRY_RUN}")
+    appendReport("Step ${thePlan.step} ${thePlan.stepCode} of campaign #${thePlan.campaignId} ${thePlan.campaignName} — ${thePlan.releaseType} — ${isVerify() ? 'verification' : 'dry run : ' + env.DRY_RUN}")
 }
 
 /**
@@ -796,6 +1014,11 @@ def stageReleaseAggregate() {
  * the released versions are in Nexus and in the aggregate POM, the failed ones were rolled back, the ones never reached are listed.
  */
 def stageReport() {
+    if (isVerify()) {
+        reportVerificationSummary()
+        echo readFile(env.STEP_REPORT)
+        return
+    }
     def report = readReport()
     def released = report.releasedVersions ?: [:]
     def failed = report.failedVersions ?: [:]
