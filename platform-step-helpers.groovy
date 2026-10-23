@@ -674,10 +674,9 @@ def runCheck(String check, String failureStatus, Closure body) {
 }
 
 /**
- * Fails when the POM in a directory declares SNAPSHOT artifacts, see snapshotProblems.
+ * Fails when the POM declares SNAPSHOT artifacts, as listed by snapshotProblems.
  */
-def checkNoDirectSnapshot(String workDir) {
-    def problems = snapshotProblems(workDir)
+def checkNoDirectSnapshot(List problems) {
     if (!problems.isEmpty()) {
         error("The POM rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
     }
@@ -687,8 +686,8 @@ def checkNoDirectSnapshot(String workDir) {
  * Fails when the resolved dependency tree holds SNAPSHOT artifacts the POM does not declare itself (dependencies of dependencies). Only a
  * warning : a Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core without any POM declaring one.
  */
-def checkNoTransitiveSnapshot(String workDir, resource) {
-    def direct = snapshotProblems(workDir) as Set
+def checkNoTransitiveSnapshot(String workDir, resource, List directProblems) {
+    def direct = directProblems as Set
     def treeFile = "${workDir}/target/releaser-dependency-tree.txt"
     dir(workDir) {
         runLogged(resource, 'Dependency tree (mvn dependency:tree)', "mvn -s ${env.MAVEN_SETTINGS_XML} -q dependency:tree -DoutputFile='${treeFile}' -DappendOutput=true")
@@ -760,8 +759,12 @@ def verifyResource(resource, boolean isAggregate) {
             result.checks << versions
             if (versions.status == 'OK') {
                 if (!isAggregate) {
-                    result.checks << runCheck('snapshot-dependencies', 'TO_FIX') { checkNoDirectSnapshot(workDir) }
-                    result.checks << runCheck('transitive-snapshot-dependencies', 'WARNING') { checkNoTransitiveSnapshot(workDir, resource) }
+                    def directProblems = []
+                    result.checks << runCheck('snapshot-dependencies', 'TO_FIX') {
+                        directProblems = snapshotProblems(workDir)
+                        checkNoDirectSnapshot(directProblems)
+                    }
+                    result.checks << runCheck('transitive-snapshot-dependencies', 'WARNING') { checkNoTransitiveSnapshot(workDir, resource, directProblems) }
                 }
                 result.checks << runCheck('build', 'TO_FIX') {
                     dir(workDir) {
@@ -821,7 +824,7 @@ def reportVerificationSummary() {
     def report = readJSON(file: env.VERIFY_REPORT, returnPojo: true)
     def results = report.components.values() + (report.aggregate ? [report.aggregate] : [])
     def toFix = results.count { it.status == 'TO_FIX' }
-    def warnings = results.count { it.status == 'WARNING' }
+    def warnings = results.count { r -> r.checks.any { it.status == 'WARNING' } }
     appendReport("Verification completed : ${toFix} to fix, ${warnings} with a warning, out of ${results.size()} resource(s). Nothing was committed nor pushed.")
     if (toFix > 0 || warnings > 0) {
         unstable("${toFix} resource(s) to fix, ${warnings} with a warning")
