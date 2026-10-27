@@ -382,6 +382,16 @@ def mustRunTests(resource) {
     return params.RUN_TESTS && (resource.type == 'lutece-plugin' || resource.type == 'lutece-core')
 }
 
+/**
+ * The Nexus repository a resource goes to, for the logs : the private one of the plan for GitLab, the one of the POM for GitHub.
+ */
+def deployTarget(resource) {
+    if (resource.deployRepository) {
+        return 'private repository'
+    }
+    return resource.scmUrl.contains('github.com') ? 'public repository' : 'private repository NOT CONFIGURED'
+}
+
 // ========================================================================
 // Release of one resource (component or aggregate)
 // ========================================================================
@@ -512,8 +522,16 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
     echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}) ==="
 
+    if (!isDryRun() && !resource.deployRepository && !resource.scmUrl.contains('github.com')) {
+        error("${coordinates(resource)} : no private Nexus repository in the plan for a GitLab resource, release refused before any change.")
+    }
     if (mustRunTests(resource)) {
-        runTests(workDir, resource)
+        def headSha = sh(script: "git -C '${workDir}' rev-parse HEAD", returnStdout: true).trim()
+        if (resource.verifiedCommit && resource.verifiedCommit == headSha) {
+            appendReport("${coordinates(resource)} : tests skipped, commit ${shortSha(headSha)} already tested by the verification")
+        } else {
+            runTests(workDir, resource)
+        }
     }
 
     if (resource.parentVersion && !isAggregate) {
@@ -539,7 +557,7 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             echo "[DRY-RUN] Would merge ${tag} into ${resource.masterBranch}"
         }
         echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
-        echo "[DRY-RUN] Would deploy ${coordinates(resource)}:${resource.targetVersion} to Nexus from ${tag}"
+        echo "[DRY-RUN] Would deploy ${coordinates(resource)}:${resource.targetVersion} to Nexus (${deployTarget(resource)}) from ${tag}"
         recordReleased(resource, isAggregate)
         return
     }
@@ -589,7 +607,8 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
 
         dir(workDir) {
             sh "git checkout -q 'refs/tags/${tag}'"
-            runLogged(resource, "Nexus deploy from ${tag}", "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true")
+            def altRepository = resource.deployRepository ? " -DaltReleaseDeploymentRepository='${resource.deployRepository}'" : ''
+            runLogged(resource, "Nexus deploy from ${tag} (${deployTarget(resource)})", "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true${altRepository}")
         }
     } catch (Throwable e) {
         rollbackResource(workDir, resource, tag, releaseSha, originSha, originMasterSha)
@@ -683,8 +702,9 @@ def checkNoDirectSnapshot(List problems) {
 }
 
 /**
- * Fails when the resolved dependency tree holds SNAPSHOT artifacts the POM does not declare itself (dependencies of dependencies). Only a
- * warning : a Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core without any POM declaring one.
+ * Fails when the resolved dependency tree holds SNAPSHOT artifacts the POM does not declare itself : a direct dependency whose version
+ * range resolved to a SNAPSHOT (a Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core), or a dependency of a
+ * dependency. Only a warning.
  */
 def checkNoTransitiveSnapshot(String workDir, resource, List directProblems) {
     def direct = directProblems as Set
@@ -692,18 +712,26 @@ def checkNoTransitiveSnapshot(String workDir, resource, List directProblems) {
     dir(workDir) {
         runLogged(resource, 'Dependency tree (mvn dependency:tree)', "mvn -s ${env.MAVEN_SETTINGS_XML} -q dependency:tree -DoutputFile='${treeFile}' -DappendOutput=true")
     }
+    def ranged = [] as Set
     def found = [] as Set
     readFile(treeFile).readLines().each { line ->
-        def m = (line =~ /^[| ]*[+\\]- ([^:\s]+):([^:\s]+):[^\s]*?([^:\s]+-SNAPSHOT)(:[a-z]+)?/)
+        def m = (line =~ /^([| ]*)[+\\]- ([^:\s]+):([^:\s]+):[^\s]*?([^:\s]+-SNAPSHOT)(:[a-z]+)?/)
         if (m.find()) {
-            def gav = "${m.group(1)}:${m.group(2)}:${m.group(3)}".toString()
+            def gav = "${m.group(2)}:${m.group(3)}:${m.group(4)}".toString()
             if (!direct.contains(gav)) {
-                found.add(gav)
+                (m.group(1).isEmpty() ? ranged : found).add(gav)
             }
         }
     }
+    def messages = []
+    if (!ranged.isEmpty()) {
+        messages.add("Version ranges of the POM resolved as SNAPSHOT : ${ranged.join(' ; ')}")
+    }
     if (!found.isEmpty()) {
-        error("SNAPSHOT artifacts reached through other dependencies : ${found.join(' ; ')}")
+        messages.add("SNAPSHOT artifacts reached through other dependencies : ${found.join(' ; ')}")
+    }
+    if (!messages.isEmpty()) {
+        error(messages.join('\n'))
     }
 }
 
@@ -919,6 +947,9 @@ def stageInitialize() {
     echo " Aggregate   : ${thePlan.aggregate ? coordinates(thePlan.aggregate) + ' ' + thePlan.aggregate.currentVersion + ' -> ' + thePlan.aggregate.targetVersion : '(none)'}"
     echo "=========================================="
     appendReport("Step ${thePlan.step} ${thePlan.stepCode} of campaign #${thePlan.campaignId} ${thePlan.campaignName} — ${thePlan.releaseType} — ${isVerify() ? 'verification' : 'dry run : ' + env.DRY_RUN}")
+    for (def despite : (thePlan.launchedDespite ?: [])) {
+        appendReport("Launched despite the verification : ${despite}")
+    }
 }
 
 /**
