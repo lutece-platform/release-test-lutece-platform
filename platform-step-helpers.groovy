@@ -751,11 +751,38 @@ def checkSomethingToRelease(String workDir, resource) {
         if (!tag) {
             return
         }
-        def commits = sh(script: "git log --no-merges --format=%s '${tag}..HEAD' | grep -v -E '^(\\[(maven-release-plugin|site-release|release-from-tag)\\]|release: |chore: )' | wc -l", returnStdout: true).trim()
-        if (commits == '0') {
+        if (realCommitsSince(tag).isEmpty()) {
             error("Nothing to release : no commit since ${tag}")
         }
     }
+}
+
+/**
+ * Fails when a stable release would publish commits made after the last beta or RC tag of its version : code never tested in a pre-release.
+ * No beta nor RC tag of the version : nothing to check.
+ */
+def checkUntestedCommits(String workDir, resource, String version) {
+    def base = version.replaceFirst(/-SNAPSHOT$/, '')
+    dir(workDir) {
+        def patterns = ["${resource.artifactId}-${base}", "v${base}"].collect { "'refs/tags/${it}-beta-*' 'refs/tags/${it}-RC-*'" }.join(' ')
+        def tag = sh(script: "git for-each-ref --sort=-creatordate --count=1 --format='%(refname:short)' ${patterns}", returnStdout: true).trim()
+        if (!tag) {
+            return
+        }
+        def commits = realCommitsSince(tag)
+        if (!commits.isEmpty()) {
+            error("${commits.size()} commit(s) after ${tag}, never tested in a beta or RC : release the component apart, or from ${tag}, or from develop anyway\n" +
+                    commits.take(5).collect { "- ${it}" }.join('\n'))
+        }
+    }
+}
+
+/**
+ * The subjects of the commits since a tag, in the current directory, but the merges and the ones written by the releases.
+ */
+def realCommitsSince(String tag) {
+    def log = sh(script: "git log --no-merges --format=%s '${tag}..HEAD' | grep -v -E '^(\\[(maven-release-plugin|site-release|release-from-tag)\\]|release: |chore: )' || true", returnStdout: true)
+    return log.readLines().findAll { it.trim() }
 }
 
 /**
@@ -877,6 +904,9 @@ def verifyResource(resource, boolean isAggregate) {
                 result.checks << runCheck('something-to-release', 'WARNING') { checkSomethingToRelease(workDir, resource) }
             } else {
                 result.checks << runCheck('tag', 'TO_FIX') { checkTagAbsent(workDir, resource) }
+            }
+            if (plan().releaseType == 'STABLE') {
+                result.checks << runCheck('untested-commits', 'TO_FIX') { checkUntestedCommits(workDir, resource, result.version) }
             }
         }
         cleanWorkTree(workDir)
