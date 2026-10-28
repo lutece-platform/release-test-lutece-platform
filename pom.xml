@@ -54,14 +54,14 @@
         <lutece.core.version>7.1.10-beta-03</lutece.core.version>
 
         <!-- Test components on GitHub (lutece-platform) -->
-        <lutece.plugin-releaser-test.version>6.2.4-SNAPSHOT</lutece.plugin-releaser-test.version>
-        <lutece.releaser-test-redmine-component.version>1.0.13-SNAPSHOT</lutece.releaser-test-redmine-component.version>
-        <lutece.releaser-test-redmine-component-buttom.version>1.0.5-SNAPSHOT</lutece.releaser-test-redmine-component-buttom.version>
+        <lutece.plugin-releaser-test.version>6.2.4-beta-02</lutece.plugin-releaser-test.version>
+        <lutece.releaser-test-redmine-component.version>1.0.14-beta-01</lutece.releaser-test-redmine-component.version>
+        <lutece.releaser-test-redmine-component-buttom.version>1.0.5-beta-02</lutece.releaser-test-redmine-component-buttom.version>
         <lutece.module-testrelease.version>0.1.8-SNAPSHOT</lutece.module-testrelease.version>
 
         <!-- Test components on GitLab (bild/u06-tests, bild/u06) -->
         <lutece.plugin-test-release-v7-v8.version>1.0.1-SNAPSHOT</lutece.plugin-test-release-v7-v8.version>
-        <lutece.releaser-test-redmine-component-gitlab.version>1.0.9-SNAPSHOT</lutece.releaser-test-redmine-component-gitlab.version>
+        <lutece.releaser-test-redmine-component-gitlab.version>1.0.9-beta-01</lutece.releaser-test-redmine-component-gitlab.version>
         <lutece.plugin-testreleasegitlab.version>2.2.10-SNAPSHOT</lutece.plugin-testreleasegitlab.version>
     </properties>
 
