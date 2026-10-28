@@ -34,19 +34,28 @@ def isDryRun() {
 }
 
 /**
- * Whether the plan asks for a verification : every check that needs a build runs on each resource, nothing is committed nor pushed.
+ * Whether the plan asks for a verification : every check that needs a build runs on each resource, nothing is committed nor pushed. The
+ * test of the SNAPSHOT of a campaign (step 0) is a verification too.
  */
 def isVerify() {
-    return env.STEP_MODE == 'VERIFY'
+    return env.STEP_MODE in ['VERIFY', 'PRECHECK']
 }
 
 /**
- * Mode of the plan : RELEASE, DRY_RUN or VERIFY. A plan without mode (releaser before the VERIFY mode) is read from its dryRun flag.
+ * Whether the plan asks for the test of every SNAPSHOT of a campaign before it starts (step 0) : the head of each branch is tested as it
+ * is, no version set and no tag checked.
+ */
+def isPrecheck() {
+    return env.STEP_MODE == 'PRECHECK'
+}
+
+/**
+ * Mode of the plan : RELEASE, DRY_RUN, VERIFY or PRECHECK. A plan without mode (releaser before the VERIFY mode) is read from its dryRun flag.
  */
 def planMode(thePlan) {
     def mode = (thePlan.mode ?: (thePlan.dryRun ? 'DRY_RUN' : 'RELEASE')).toString().toUpperCase()
-    if (!(mode in ['RELEASE', 'DRY_RUN', 'VERIFY'])) {
-        error("Unknown plan mode '${mode}' : RELEASE, DRY_RUN or VERIFY expected.")
+    if (!(mode in ['RELEASE', 'DRY_RUN', 'VERIFY', 'PRECHECK'])) {
+        error("Unknown plan mode '${mode}' : RELEASE, DRY_RUN, VERIFY or PRECHECK expected.")
     }
     return mode
 }
@@ -702,11 +711,59 @@ def checkNoDirectSnapshot(List problems) {
 }
 
 /**
+ * The SNAPSHOT problems that the campaign will not release (step 0) : a SNAPSHOT parent or dependency whose "groupId:artifactId" is not in
+ * the campaign coordinates of the plan.
+ */
+def outsideCampaign(String workDir, List problems) {
+    def campaign = (plan().campaignCoordinates ?: []) as Set
+    def outside = []
+    for (def problem : problems) {
+        def parts = problem.split(':')
+        def coords = problem.startsWith('parent ') ? parentCoordinates(workDir) : "${parts[0]}:${parts[1]}".toString()
+        if (!campaign.contains(coords)) {
+            outside.add(problem)
+        }
+    }
+    return outside
+}
+
+/**
+ * The "groupId:artifactId" of the parent of the POM in a directory, empty when it has none.
+ */
+def parentCoordinates(String workDir) {
+    def id = ''
+    dir(workDir) {
+        id = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.id -DforceStdout 2>/dev/null | tail -1 || true", returnStdout: true).trim()
+    }
+    def parts = id.split(':')
+    return parts.size() >= 2 ? "${parts[0]}:${parts[1]}".toString() : ''
+}
+
+/**
+ * Fails when the head of the branch has no commit since the last stable release tag of the resource but the ones written by the releases
+ * (maven-release-plugin, releaser, step pipeline) : the release would publish the same code again. The beta and RC tags are skipped, a
+ * stable released from a beta without change is expected. Only a warning. No tag : first release.
+ */
+def checkSomethingToRelease(String workDir, resource) {
+    dir(workDir) {
+        def exclude = "--exclude '*-beta-*' --exclude '*-RC-*'"
+        def tag = sh(script: "git describe --tags --abbrev=0 --match '${resource.artifactId}-[0-9]*' ${exclude} 2>/dev/null || git describe --tags --abbrev=0 --match 'v[0-9]*' ${exclude} 2>/dev/null || true", returnStdout: true).trim()
+        if (!tag) {
+            return
+        }
+        def commits = sh(script: "git log --no-merges --format=%s '${tag}..HEAD' | grep -v -E '^(\\[(maven-release-plugin|site-release|release-from-tag)\\]|release: |chore: )' | wc -l", returnStdout: true).trim()
+        if (commits == '0') {
+            error("Nothing to release : no commit since ${tag}")
+        }
+    }
+}
+
+/**
  * Fails when the resolved dependency tree holds SNAPSHOT artifacts the POM does not declare itself : a direct dependency whose version
  * range resolved to a SNAPSHOT (a Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core), or a dependency of a
- * dependency. Only a warning.
+ * dependency. The artifacts of the campaign (step 0) are ignored. Only a warning.
  */
-def checkNoTransitiveSnapshot(String workDir, resource, List directProblems) {
+def checkNoTransitiveSnapshot(String workDir, resource, List directProblems, Set ignoredCoordinates) {
     def direct = directProblems as Set
     def treeFile = "${workDir}/target/releaser-dependency-tree.txt"
     dir(workDir) {
@@ -718,7 +775,7 @@ def checkNoTransitiveSnapshot(String workDir, resource, List directProblems) {
         def m = (line =~ /^([| ]*)[+\\]- ([^:\s]+):([^:\s]+):[^\s]*?([^:\s]+-SNAPSHOT)(:[a-z]+)?/)
         if (m.find()) {
             def gav = "${m.group(2)}:${m.group(3)}:${m.group(4)}".toString()
-            if (!direct.contains(gav)) {
+            if (!direct.contains(gav) && !ignoredCoordinates.contains("${m.group(2)}:${m.group(3)}".toString())) {
                 (m.group(1).isEmpty() ? ranged : found).add(gav)
             }
         }
@@ -758,11 +815,16 @@ def checkTagAbsent(String workDir, resource) {
  * WARNING), the commit verified (head of the branch at clone time) and the result of each check.
  */
 def verifyResource(resource, boolean isAggregate) {
-    def result = [status: 'OK', version: resource.targetVersion, commit: '', checks: []]
+    def precheck = isPrecheck()
+    def result = [status: 'OK', version: precheck ? resource.currentVersion : resource.targetVersion, commit: '', checks: []]
     if (isAggregate) {
         result.note = 'verified before the version updates'
     }
-    echo "=== Verifying ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}) ==="
+    if (precheck) {
+        echo "=== Testing ${coordinates(resource)} ${resource.currentVersion} as it is on the head of ${resource.branch} ==="
+    } else {
+        echo "=== Verifying ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}) ==="
+    }
     def workDir = null
     def clone = runCheck('clone', 'TO_FIX') {
         workDir = cloneResource(resource)
@@ -776,23 +838,34 @@ def verifyResource(resource, boolean isAggregate) {
                 result.checks << runCheck('tests', 'TO_FIX') { runTests(workDir, resource) }
                 cleanWorkTree(workDir)
             }
-            def versions = runCheck('versions', 'TO_FIX') {
-                if (resource.parentVersion && !isAggregate) {
-                    setParentVersion(workDir, resource.parentVersion)
+            def versions = [status: 'OK']
+            if (!precheck) {
+                versions = runCheck('versions', 'TO_FIX') {
+                    if (resource.parentVersion && !isAggregate) {
+                        setParentVersion(workDir, resource.parentVersion)
+                    }
+                    if (!isAggregate) {
+                        setResourceVersion(workDir, resource, resource.targetVersion)
+                    }
                 }
-                if (!isAggregate) {
-                    setResourceVersion(workDir, resource, resource.targetVersion)
-                }
+                result.checks << versions
             }
-            result.checks << versions
             if (versions.status == 'OK') {
                 if (!isAggregate) {
                     def directProblems = []
+                    def ignored = precheck ? ((plan().campaignCoordinates ?: []) as Set) : ([] as Set)
                     result.checks << runCheck('snapshot-dependencies', 'TO_FIX') {
                         directProblems = snapshotProblems(workDir)
-                        checkNoDirectSnapshot(directProblems)
+                        if (precheck) {
+                            def outside = outsideCampaign(workDir, directProblems)
+                            if (!outside.isEmpty()) {
+                                error("SNAPSHOT artifacts outside the campaign, never released by it : ${outside.join(' ; ')}")
+                            }
+                        } else {
+                            checkNoDirectSnapshot(directProblems)
+                        }
                     }
-                    result.checks << runCheck('transitive-snapshot-dependencies', 'WARNING') { checkNoTransitiveSnapshot(workDir, resource, directProblems) }
+                    result.checks << runCheck('transitive-snapshot-dependencies', 'WARNING') { checkNoTransitiveSnapshot(workDir, resource, directProblems, ignored) }
                 }
                 result.checks << runCheck('build', 'TO_FIX') {
                     dir(workDir) {
@@ -800,7 +873,11 @@ def verifyResource(resource, boolean isAggregate) {
                     }
                 }
             }
-            result.checks << runCheck('tag', 'TO_FIX') { checkTagAbsent(workDir, resource) }
+            if (precheck) {
+                result.checks << runCheck('something-to-release', 'WARNING') { checkSomethingToRelease(workDir, resource) }
+            } else {
+                result.checks << runCheck('tag', 'TO_FIX') { checkTagAbsent(workDir, resource) }
+            }
         }
         cleanWorkTree(workDir)
     }
@@ -813,7 +890,7 @@ def verifyResource(resource, boolean isAggregate) {
  * Writes the result of a verified resource in the step report : one line, then the first lines of each check that did not pass.
  */
 def reportVerification(resource, result) {
-    def line = "${result.status == 'OK' ? 'VERIFIED' : (result.status == 'TO_FIX' ? 'TO FIX' : 'WARNING')} ${coordinates(resource)} ${resource.targetVersion}" +
+    def line = "${result.status == 'OK' ? 'VERIFIED' : (result.status == 'TO_FIX' ? 'TO FIX' : 'WARNING')} ${coordinates(resource)} ${result.version}" +
             (result.commit ? " (commit ${shortSha(result.commit)})" : '') + (result.note ? " — ${result.note}" : '')
     def details = result.checks.findAll { it.status != 'OK' }.collect { check ->
         def lines = check.details.readLines().findAll { it.trim() }
@@ -827,7 +904,7 @@ def reportVerification(resource, result) {
  */
 def stageVerifyComponents() {
     def thePlan = plan()
-    def report = [mode: 'VERIFY', components: [:], aggregate: null]
+    def report = [mode: env.STEP_MODE, components: [:], aggregate: null]
     writeVerifyReport(report)
     thePlan.components.each { component ->
         def result = verifyResource(component, false)
@@ -920,7 +997,7 @@ def stageInitialize() {
         error('RELEASE_PLAN is empty : this job is meant to be triggered by the releaser with the plan of a step.')
     }
     def thePlan = readJSON(text: params.RELEASE_PLAN, returnPojo: true)
-    if (!thePlan.stepCode || thePlan.components == null) {
+    if ((!thePlan.stepCode && planMode(thePlan) != 'PRECHECK') || thePlan.components == null) {
         error('RELEASE_PLAN is not a step plan : stepCode and components are required.')
     }
     env.PLAN_JSON = params.RELEASE_PLAN
@@ -940,13 +1017,17 @@ def stageInitialize() {
     echo "=========================================="
     echo " Lutece Platform Step Pipeline"
     echo " Campaign    : #${thePlan.campaignId} ${thePlan.campaignName}"
-    echo " Step        : ${thePlan.step} ${thePlan.stepCode}"
+    echo " Step        : ${thePlan.step} ${thePlan.stepCode ?: 'test of the SNAPSHOT of the campaign'}"
     echo " Type        : ${thePlan.releaseType} (core ${thePlan.coreMajor})"
     echo " Mode        : ${env.STEP_MODE}"
     echo " Components  : ${thePlan.components.size()}"
     echo " Aggregate   : ${thePlan.aggregate ? coordinates(thePlan.aggregate) + ' ' + thePlan.aggregate.currentVersion + ' -> ' + thePlan.aggregate.targetVersion : '(none)'}"
     echo "=========================================="
-    appendReport("Step ${thePlan.step} ${thePlan.stepCode} of campaign #${thePlan.campaignId} ${thePlan.campaignName} — ${thePlan.releaseType} — ${isVerify() ? 'verification' : 'dry run : ' + env.DRY_RUN}")
+    if (isPrecheck()) {
+        appendReport("Step 0 — test of the SNAPSHOT of campaign #${thePlan.campaignId} ${thePlan.campaignName} — ${thePlan.components.size()} resource(s), core ${thePlan.coreMajor}")
+    } else {
+        appendReport("Step ${thePlan.step} ${thePlan.stepCode} of campaign #${thePlan.campaignId} ${thePlan.campaignName} — ${thePlan.releaseType} — ${isVerify() ? 'verification' : 'dry run : ' + env.DRY_RUN}")
+    }
     for (def despite : (thePlan.launchedDespite ?: [])) {
         appendReport("Launched despite the verification : ${despite}")
     }
