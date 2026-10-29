@@ -771,7 +771,7 @@ def checkUntestedCommits(String workDir, resource, String version) {
         }
         def commits = realCommitsSince(tag)
         if (!commits.isEmpty()) {
-            error("${commits.size()} commit(s) after ${tag}, never tested in a beta or RC : release the component apart, or from ${tag}, or from develop anyway\n" +
+            error("${commits.size()} commit(s) after ${tag}, never tested in a beta or RC : release the component apart, or from ${tag}, or from the SNAPSHOT anyway\n" +
                     commits.take(5).collect { "- ${it}" }.join('\n'))
         }
     }
