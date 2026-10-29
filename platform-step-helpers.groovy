@@ -7,6 +7,11 @@
  * Loaded with : def helpers = load('platform-step-helpers.groovy')
  */
 
+import groovy.transform.Field
+
+// Lock of the reports between the parallel branches of a verification
+@Field def reportLock = [busy: false]
+
 // ========================================================================
 // Plan and report
 // ========================================================================
@@ -930,18 +935,70 @@ def reportVerification(resource, result) {
 }
 
 /**
+ * Number of resources verified at the same time, sent by the releaser in the plan : 1 when absent.
+ */
+def verifyParallelism() {
+    def value = plan().parallelism
+    return value ? Math.max(1, value as int) : 1
+}
+
+/**
+ * Runs a body alone among the parallel branches. Jenkins only switches branches on a step : the test and the set of the flag cannot be
+ * split, the sleep is the only step of the wait.
+ */
+def withReportLock(Closure body) {
+    while (reportLock.busy) {
+        sleep(time: 1, unit: 'SECONDS')
+    }
+    reportLock.busy = true
+    try {
+        body()
+    } finally {
+        reportLock.busy = false
+    }
+}
+
+/**
+ * Verifies the components, by N workers taking the next one from a shared queue. The verification report and the step report are
+ * written under the lock, as several branches end at the same time.
+ */
+def verifyComponents(components, report) {
+    def queue = new ArrayList(components)
+    def workerCount = Math.min(verifyParallelism(), Math.max(1, queue.size()))
+    def worker = {
+        while (!queue.isEmpty()) {
+            def component = queue.remove(0)
+            def result = verifyResource(component, false)
+            withReportLock {
+                report.components[coordinates(component)] = result
+                writeVerifyReport(report)
+                reportVerification(component, result)
+            }
+        }
+    }
+    if (workerCount == 1) {
+        worker()
+        return
+    }
+    echo "Verifying ${queue.size()} component(s), ${workerCount} at a time"
+    def branches = [:]
+    for (int i = 1; i <= workerCount; i++) {
+        branches["worker-${i}"] = worker
+    }
+    // Maven 3.9 : lock the shared local repository while several builds download into it
+    withEnv(["MAVEN_OPTS=${env.MAVEN_OPTS ?: ''} -Daether.syncContext.named.factory=file-lock -Daether.syncContext.named.nameMapper=file-gav"]) {
+        parallel branches
+    }
+}
+
+/**
  * Stage 2 (mode VERIFY) — Verify the components, then the aggregate, the verification report growing after each one.
  */
 def stageVerifyComponents() {
     def thePlan = plan()
     def report = [mode: env.STEP_MODE, components: [:], aggregate: null]
     writeVerifyReport(report)
-    thePlan.components.each { component ->
-        def result = verifyResource(component, false)
-        report.components[coordinates(component)] = result
-        writeVerifyReport(report)
-        reportVerification(component, result)
-    }
+    verifyComponents(thePlan.components, report)
     if (thePlan.aggregate) {
         def result = verifyResource(thePlan.aggregate, true)
         result.coordinates = coordinates(thePlan.aggregate)
