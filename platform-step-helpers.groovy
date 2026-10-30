@@ -450,45 +450,95 @@ def remoteBranchSha(String workDir, String scmUrl, String branch) {
 }
 
 /**
+ * Checks out, detached, the beta or RC tag a resource is released from and returns its commit. The tag must be a pre-release of the target
+ * version ("<artifactId>-<target>-beta-NN", "-RC-NN", or "v<target>-..."), otherwise the release is refused before any change.
+ */
+def checkoutSourceTag(String workDir, resource) {
+    def sourceTag = resource.sourceTag.toString()
+    def prefixes = ["${resource.artifactId}-${resource.targetVersion}", "v${resource.targetVersion}"].collectMany { ["${it}-beta-".toString(), "${it}-RC-".toString()] }
+    if (!prefixes.any { sourceTag.startsWith(it) }) {
+        error("${coordinates(resource)} : tag ${sourceTag} is not a beta or RC of ${resource.targetVersion}, release refused before any change.")
+    }
+    def sha = ''
+    withRepositoryUrl(resource.scmUrl) { authUrl ->
+        dir(workDir) {
+            runLogged(resource, "Checkout of tag ${sourceTag}", """
+                git fetch -q "${authUrl}" 'refs/tags/${sourceTag}:refs/tags/${sourceTag}'
+                git checkout -q --detach 'refs/tags/${sourceTag}^{commit}'
+            """)
+            sha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+        }
+    }
+    return sha
+}
+
+/**
  * Refuses to release a resource whose POM, versions set, still declares SNAPSHOT artifacts : a SNAPSHOT parent, or a dependency whose
  * declared version (properties resolved, every module of a multi-module build) is a SNAPSHOT. Declared versions, not resolved ones : a
  * Lutece range such as [7.0.0,8.0.0) may resolve to a SNAPSHOT of the core without the POM declaring one, exactly as the maven-release-plugin
- * of the classic release judges it. Runs before any commit, so nothing is to roll back.
+ * of the classic release judges it. A stable version of a component is refused on a beta or RC parent or dependency too. Runs before any
+ * commit, so nothing is to roll back.
  */
-def checkSnapshotDependencies(String workDir, resource) {
-    def problems = snapshotProblems(workDir)
+def checkReleaseDependencies(String workDir, resource, boolean isAggregate) {
+    def declared = declaredVersions(workDir)
+    def problems = snapshotProblems(declared)
     if (!problems.isEmpty()) {
         appendReport("${coordinates(resource)} : release refused, the POM rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
         error("${coordinates(resource)} rests on SNAPSHOT artifacts : ${problems.join(' ; ')}")
     }
+    def prereleases = mustCheckPrereleases(isAggregate) ? prereleaseProblems(declared) : []
+    if (!prereleases.isEmpty()) {
+        appendReport("${coordinates(resource)} : release refused, a stable version rests on beta or RC artifacts : ${prereleases.join(' ; ')}")
+        error("${coordinates(resource)} rests on beta or RC artifacts : ${prereleases.join(' ; ')}")
+    }
 }
 
 /**
- * The SNAPSHOT artifacts the POM in a directory declares : its parent, and the dependencies whose declared version is a SNAPSHOT
- * ("parent x.y.z-SNAPSHOT", "groupId:artifactId:version"). Empty when the POM declares none.
+ * Whether the beta and RC artifacts are refused : for a component of a stable step, not for the aggregate.
  */
-def snapshotProblems(String workDir) {
-    def problems = []
+def mustCheckPrereleases(boolean isAggregate) {
+    return !isAggregate && !isPrecheck() && plan().releaseType == 'STABLE'
+}
+
+/**
+ * The versions the POM in a directory declares : its parent, then each dependency once ("parent x.y.z", "groupId:artifactId:version").
+ */
+def declaredVersions(String workDir) {
+    def versions = []
     dir(workDir) {
         def parentVersion = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.version -DforceStdout 2>/dev/null | tail -1 || true", returnStdout: true).trim()
         def declared = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null || true", returnStdout: true)
-        def snapshots = [] as Set
+        def dependencies = [] as Set
         def current = [:]
         declared.readLines().each { line ->
             def m = (line =~ /<(groupId|artifactId|version)>([^<]*)<\/\1>/)
             if (m.find()) {
                 current[m.group(1)] = m.group(2)
-                if (m.group(1) == 'version' && m.group(2).endsWith('-SNAPSHOT')) {
-                    snapshots.add("${current.groupId}:${current.artifactId}:${m.group(2)}".toString())
+                if (m.group(1) == 'version') {
+                    dependencies.add("${current.groupId}:${current.artifactId}:${m.group(2)}".toString())
                 }
             }
         }
-        if (parentVersion.endsWith('-SNAPSHOT')) {
-            problems.add("parent ${parentVersion}".toString())
+        if (parentVersion && !parentVersion.startsWith('null object')) {
+            versions.add("parent ${parentVersion}".toString())
         }
-        problems.addAll(snapshots)
+        versions.addAll(dependencies)
     }
-    return problems
+    return versions
+}
+
+/**
+ * The SNAPSHOT artifacts among the declared versions. Empty when the POM declares none.
+ */
+def snapshotProblems(List declared) {
+    return declared.findAll { it.endsWith('-SNAPSHOT') }
+}
+
+/**
+ * The beta and RC artifacts among the declared versions (x.y.z-beta-NN, x.y.z-RC-NN, or a bare -beta / -RC). Empty when the POM declares none.
+ */
+def prereleaseProblems(List declared) {
+    return declared.findAll { it ==~ /(?i).*-(beta|rc)(-\d+)?/ }
 }
 
 /**
@@ -530,14 +580,20 @@ def checkCompiles(String workDir, resource) {
  * repository back like the releaser does (release branch and master branch force-pushed to their commits of before the release, tag
  * deleted) : as nothing is in Nexus before the last command, the same version can be released again. The release commit is compiled
  * before any push. The resource is recorded in the report once deployed. In dry run the local part runs, compilation included, and the
- * publication is only logged.
+ * publication is only logged. A resource with a sourceTag is released from that beta or RC tag : only the release tag is pushed, then the
+ * branch gets the next snapshot and an "ours" merge of the release tag, so that its later releases merge into master without conflict.
  */
 def releaseResource(String workDir, resource, boolean isAggregate) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
-    echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}) ==="
+    def sourceTag = resource.sourceTag ? resource.sourceTag.toString() : ''
+    echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}${sourceTag ? ', from ' + sourceTag : ''}) ==="
 
     if (!isDryRun() && !resource.deployRepository && !resource.scmUrl.contains('github.com')) {
         error("${coordinates(resource)} : no private Nexus repository in the plan for a GitLab resource, release refused before any change.")
+    }
+    if (sourceTag) {
+        checkoutSourceTag(workDir, resource)
+        appendReport("${coordinates(resource)} : released from ${sourceTag}")
     }
     if (mustRunTests(resource)) {
         def headSha = sh(script: "git -C '${workDir}' rev-parse HEAD", returnStdout: true).trim()
@@ -553,12 +609,13 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         appendReport("${coordinates(resource)} : parent POM set to ${resource.parentVersion} before the release")
     }
     setResourceVersion(workDir, resource, resource.targetVersion)
-    checkSnapshotDependencies(workDir, resource)
+    checkReleaseDependencies(workDir, resource, isAggregate)
     def releaseSha = ''
+    def releaseMessage = sourceTag ? "release: ${tag} (from ${sourceTag})" : "release: ${tag}"
     dir(workDir) {
         sh """
             git add -u
-            git diff --cached --quiet && echo 'Version already at ${resource.targetVersion} — nothing to commit' || git commit -m "release: ${tag}"
+            git diff --cached --quiet && echo 'Version already at ${resource.targetVersion} — nothing to commit' || git commit -m "${releaseMessage}"
             git tag -fa '${tag}' -m "Release ${resource.artifactId} ${resource.targetVersion}"
         """
         releaseSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
@@ -566,11 +623,14 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     checkCompiles(workDir, resource)
 
     if (isDryRun()) {
-        echo "[DRY-RUN] Would push ${resource.branch} and tag ${tag}"
+        echo sourceTag ? "[DRY-RUN] Would push tag ${tag} only" : "[DRY-RUN] Would push ${resource.branch} and tag ${tag}"
         if (resource.masterBranch) {
             echo "[DRY-RUN] Would merge ${tag} into ${resource.masterBranch}"
         }
         echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
+        if (sourceTag) {
+            echo "[DRY-RUN] Would merge ${tag} into ${resource.branch} keeping its content (ours), then push ${resource.branch}"
+        }
         echo "[DRY-RUN] Would deploy ${coordinates(resource)}:${resource.targetVersion} to Nexus (${deployTarget(resource)}) from ${tag}"
         recordReleased(resource, isAggregate)
         return
@@ -582,10 +642,14 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     try {
         withRepositoryUrl(resource.scmUrl) { authUrl ->
             dir(workDir) {
-                runLogged(resource, "Push of ${resource.branch} and tag ${tag}", """
-                    git push "${authUrl}" '${resource.branch}'
-                    git push "${authUrl}" 'refs/tags/${tag}'
-                """)
+                if (sourceTag) {
+                    runLogged(resource, "Push of tag ${tag}", "git push \"${authUrl}\" 'refs/tags/${tag}'")
+                } else {
+                    runLogged(resource, "Push of ${resource.branch} and tag ${tag}", """
+                        git push "${authUrl}" '${resource.branch}'
+                        git push "${authUrl}" 'refs/tags/${tag}'
+                    """)
+                }
             }
         }
 
@@ -606,6 +670,11 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             }
         }
 
+        if (sourceTag) {
+            dir(workDir) {
+                sh "git checkout -q '${resource.branch}'"
+            }
+        }
         if (resource.nextSnapshotVersion) {
             setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
             withRepositoryUrl(resource.scmUrl) { authUrl ->
@@ -613,6 +682,16 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
                     runLogged(resource, "Next development version ${resource.nextSnapshotVersion}", """
                         git add -u
                         git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
+                        git push "${authUrl}" '${resource.branch}'
+                    """)
+                }
+            }
+        }
+        if (sourceTag) {
+            withRepositoryUrl(resource.scmUrl) { authUrl ->
+                dir(workDir) {
+                    runLogged(resource, "Merge of ${tag} into ${resource.branch}, content of ${resource.branch} kept", """
+                        git merge -s ours -m "Merge ${tag} into ${resource.branch} (content of ${resource.branch} kept)" '${tag}^{commit}'
                         git push "${authUrl}" '${resource.branch}'
                     """)
                 }
@@ -716,6 +795,15 @@ def checkNoDirectSnapshot(List problems) {
 }
 
 /**
+ * Fails when the POM of a stable version declares beta or RC artifacts, as listed by prereleaseProblems.
+ */
+def checkNoPrerelease(List problems) {
+    if (!problems.isEmpty()) {
+        error("A stable version rests on beta or RC artifacts : ${problems.join(' ; ')}")
+    }
+}
+
+/**
  * The SNAPSHOT problems that the campaign will not release (step 0) : a SNAPSHOT parent or dependency whose "groupId:artifactId" is not in
  * the campaign coordinates of the plan.
  */
@@ -764,9 +852,9 @@ def checkSomethingToRelease(String workDir, resource) {
 
 /**
  * Fails when a stable release would publish commits made after the last beta or RC tag of its version : code never tested in a pre-release.
- * No beta nor RC tag of the version : nothing to check.
+ * No beta nor RC tag of the version : nothing to check. The tag is kept in result.untestedSinceTag, for the releaser to offer a release from it.
  */
-def checkUntestedCommits(String workDir, resource, String version) {
+def checkUntestedCommits(String workDir, resource, String version, result) {
     def base = version.replaceFirst(/-SNAPSHOT$/, '')
     dir(workDir) {
         def patterns = ["${resource.artifactId}-${base}", "v${base}"].collect { "'refs/tags/${it}-beta-*' 'refs/tags/${it}-RC-*'" }.join(' ')
@@ -776,6 +864,7 @@ def checkUntestedCommits(String workDir, resource, String version) {
         }
         def commits = realCommitsSince(tag)
         if (!commits.isEmpty()) {
+            result.untestedSinceTag = tag
             error("${commits.size()} commit(s) after ${tag}, never tested in a beta or RC : release the component apart, or from ${tag}, or from the SNAPSHOT anyway\n" +
                     commits.take(5).collect { "- ${it}" }.join('\n'))
         }
@@ -844,7 +933,8 @@ def checkTagAbsent(String workDir, resource) {
  * Verifies one resource as its release would build it, without committing nor pushing anything : clone, tests (plugins and core), versions
  * set, SNAPSHOT artifacts, compilation and packaging of the release profile, tag. The aggregate is verified on its current POM, which still
  * references the SNAPSHOT versions of the components of the step : its SNAPSHOT checks are skipped. Returns the status (OK, TO_FIX,
- * WARNING), the commit verified (head of the branch at clone time) and the result of each check.
+ * WARNING), the commit verified (head of the branch at clone time, or commit of the sourceTag the resource is released from) and the result
+ * of each check.
  */
 def verifyResource(resource, boolean isAggregate) {
     def precheck = isPrecheck()
@@ -861,6 +951,11 @@ def verifyResource(resource, boolean isAggregate) {
     def clone = runCheck('clone', 'TO_FIX') {
         workDir = cloneResource(resource)
         result.commit = readFile("${workDir}/.git/releaser-origin-sha").trim()
+    }
+    if (clone.status == 'OK' && resource.sourceTag && !precheck) {
+        result.sourceTag = resource.sourceTag.toString()
+        echo "Verifying from tag ${result.sourceTag}"
+        clone = runCheck('source-tag', 'TO_FIX') { result.commit = checkoutSourceTag(workDir, resource) }
     }
     if (clone.status != 'OK') {
         result.checks << clone
@@ -884,10 +979,12 @@ def verifyResource(resource, boolean isAggregate) {
             }
             if (versions.status == 'OK') {
                 if (!isAggregate) {
+                    def declared = []
                     def directProblems = []
                     def ignored = precheck ? ((plan().campaignCoordinates ?: []) as Set) : ([] as Set)
                     result.checks << runCheck('snapshot-dependencies', 'TO_FIX') {
-                        directProblems = snapshotProblems(workDir)
+                        declared = declaredVersions(workDir)
+                        directProblems = snapshotProblems(declared)
                         if (precheck) {
                             def outside = outsideCampaign(workDir, directProblems)
                             if (!outside.isEmpty()) {
@@ -896,6 +993,9 @@ def verifyResource(resource, boolean isAggregate) {
                         } else {
                             checkNoDirectSnapshot(directProblems)
                         }
+                    }
+                    if (mustCheckPrereleases(false)) {
+                        result.checks << runCheck('prerelease-dependencies', 'TO_FIX') { checkNoPrerelease(prereleaseProblems(declared)) }
                     }
                     result.checks << runCheck('transitive-snapshot-dependencies', 'WARNING') { checkNoTransitiveSnapshot(workDir, resource, directProblems, ignored) }
                 }
@@ -911,7 +1011,7 @@ def verifyResource(resource, boolean isAggregate) {
                 result.checks << runCheck('tag', 'TO_FIX') { checkTagAbsent(workDir, resource) }
             }
             if (plan().releaseType == 'STABLE') {
-                result.checks << runCheck('untested-commits', 'TO_FIX') { checkUntestedCommits(workDir, resource, result.version) }
+                result.checks << runCheck('untested-commits', 'TO_FIX') { checkUntestedCommits(workDir, resource, result.version, result) }
             }
         }
         cleanWorkTree(workDir)
