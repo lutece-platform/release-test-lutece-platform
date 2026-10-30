@@ -582,6 +582,7 @@ def checkCompiles(String workDir, resource) {
  * before any push. The resource is recorded in the report once deployed. In dry run the local part runs, compilation included, and the
  * publication is only logged. A resource with a sourceTag is released from that beta or RC tag : only the release tag is pushed, then the
  * branch gets the next snapshot and an "ours" merge of the release tag, so that its later releases merge into master without conflict.
+ * An aggregate released from a tag is already on it (see updateAggregatePom) ; its branch also gets the version updates.
  */
 def releaseResource(String workDir, resource, boolean isAggregate) {
     def tag = "${resource.artifactId}-${resource.targetVersion}".toString()
@@ -592,7 +593,9 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         error("${coordinates(resource)} : no private Nexus repository in the plan for a GitLab resource, release refused before any change.")
     }
     if (sourceTag) {
-        checkoutSourceTag(workDir, resource)
+        if (!isAggregate) {
+            checkoutSourceTag(workDir, resource)
+        }
         appendReport("${coordinates(resource)} : released from ${sourceTag}")
     }
     if (mustRunTests(resource)) {
@@ -628,6 +631,9 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             echo "[DRY-RUN] Would merge ${tag} into ${resource.masterBranch}"
         }
         echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
+        if (sourceTag && isAggregate) {
+            echo "[DRY-RUN] Would apply the version updates on ${resource.branch}"
+        }
         if (sourceTag) {
             echo "[DRY-RUN] Would merge ${tag} into ${resource.branch} keeping its content (ours), then push ${resource.branch}"
         }
@@ -673,6 +679,15 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         if (sourceTag) {
             dir(workDir) {
                 sh "git checkout -q '${resource.branch}'"
+            }
+            if (isAggregate) {
+                applyVersionUpdates(workDir, resource, " on ${resource.branch}")
+                dir(workDir) {
+                    sh """
+                        git add -u
+                        git diff --cached --quiet && echo '${resource.branch} already up to date — nothing to commit' || git commit -m "chore: update versions on ${resource.branch} after the release of ${tag}"
+                    """
+                }
             }
         }
         if (resource.nextSnapshotVersion) {
@@ -1132,9 +1147,9 @@ def reportVerificationSummary() {
  * (property name -> value) and the dependency declarations ("groupId:artifactId" -> version, the <version> tag right after the
  * <artifactId> tag). Nothing is guessed here : a version held by a property comes in "properties", never in "dependencies".
  * The updates of the components of this step that were not published (failed, or never reached) are left out : the POM only
- * references versions that exist.
+ * references versions that exist. The suffix tells in the report where they are applied, for an aggregate released from a tag.
  */
-def applyVersionUpdates(String workDir, aggregate) {
+def applyVersionUpdates(String workDir, aggregate, String suffix = '') {
     def skippedProperties = [] as Set
     def skippedDependencies = [] as Set
     plan().components.each { component ->
@@ -1151,7 +1166,7 @@ def applyVersionUpdates(String workDir, aggregate) {
         if (aggregate.parentVersion) {
             sh "sed -i '/<parent>/,/<\\/parent>/ s|<version>[^<]*</version>|<version>${aggregate.parentVersion}</version>|' pom.xml"
             echo "Parent version -> ${aggregate.parentVersion}"
-            appendReport("${coordinates(aggregate)} : parent POM set to ${aggregate.parentVersion}")
+            appendReport("${coordinates(aggregate)} : parent POM set to ${aggregate.parentVersion}${suffix}")
         }
         def updates = aggregate.versionUpdates ?: [:]
         (updates.properties ?: [:]).each { name, version ->
@@ -1261,10 +1276,15 @@ def stageUpdateAggregate() {
 
 /**
  * Clones the aggregate, applies the version updates and commits them ; pushes the POM when the aggregate is not released by this step.
+ * An aggregate released from a tag (the core) gets them on top of that tag, the branch getting them after the release.
  */
 def updateAggregatePom(aggregate) {
     def workDir = cloneResource(aggregate)
     env.AGGREGATE_DIR = workDir
+    if (aggregate.sourceTag && isAggregateReleased() && !hasFailures()) {
+        checkoutSourceTag(workDir, aggregate)
+        appendReport("${coordinates(aggregate)} : version updates applied on ${aggregate.sourceTag}")
+    }
     applyVersionUpdates(workDir, aggregate)
 
     dir(workDir) {
