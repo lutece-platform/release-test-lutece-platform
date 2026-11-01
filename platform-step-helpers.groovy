@@ -291,9 +291,11 @@ esac
 def writeMavenWrapper() {
     // Maven is resolved by its Jenkins tool, by absolute path : a tools { maven } block would put the real mvn before the wrapper on the PATH
     sh "rm -rf '${env.RELEASER_BIN}'"
-    def real = "${tool(name: params.MAVEN_TOOL, type: 'maven')}/bin/mvn".toString()
+    // A parameter added to the Jenkinsfile is null in the first build that declares it
+    def mavenTool = params.MAVEN_TOOL ?: 'maven-3.9.12'
+    def real = "${tool(name: mavenTool, type: 'maven')}/bin/mvn".toString()
     if (!fileExists(real)) {
-        error("mvn not found in the Maven tool '${params.MAVEN_TOOL}' (${real})")
+        error("mvn not found in the Maven tool '${mavenTool}' (${real})")
     }
     sh "mkdir -p '${env.RELEASER_BIN}'"
     writeFile file: "${env.RELEASER_BIN}/mvn", text: """#!/bin/sh
