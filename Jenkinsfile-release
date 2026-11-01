@@ -42,8 +42,8 @@ pipeline {
     // Bootstrap toolchain only: this JDK runs the version/tag/Maven-evaluation
     // steps. The JDK that actually compiles and deploys each artifact is picked
     // at runtime from the POM's targetJdk (see helpers.withJdk / JDK_TOOL_MAP).
+    // No maven here : a tools { maven } block puts the real mvn before the wrapper on the PATH, see helpers.writeMavenWrapper
     tools {
-        maven 'maven-3.9.12'
         jdk 'temurin-17-jdk'
     }
 
@@ -129,6 +129,11 @@ pipeline {
             description: 'ID du Config File Provider pour le settings.xml Maven.'
         )
         string(
+            name: 'MAVEN_TOOL',
+            defaultValue: 'maven-3.9.12',
+            description: 'Nom de l\'outil Maven Jenkins, lance par le wrapper sans les tokens dans son environnement.'
+        )
+        string(
             name: 'GIT_USER_NAME',
             defaultValue: 'ryahiaoui',
             description: 'Nom utilisateur pour les commits git de la release.'
@@ -145,6 +150,9 @@ pipeline {
         // git asks the login and the token to this script, written by the Initialize stage from the build parameters
         GIT_ASKPASS = "${WORKSPACE}/.git-askpass.sh"
         GIT_TERMINAL_PROMPT = '0'
+        // "mvn" wrapper written by the Initialize stage : Maven runs without the tokens in its environment
+        RELEASER_BIN = "${WORKSPACE}/.releaser-bin"
+        PATH = "${WORKSPACE}/.releaser-bin:${PATH}"
     }
 
     stages {
@@ -152,6 +160,8 @@ pipeline {
         stage('Initialize') {
             steps {
                 script {
+                    // The workspace is kept between builds : a report left by a previous build must never be sent as this one's
+                    sh "rm -rf '${env.RELEASE_REPORT}' '${env.RELEASER_BIN}'"
                     helpers = load('release-helpers.groovy')
                     helpers.stageInitialize()
                 }

@@ -241,10 +241,77 @@ def resolveMasterBranch() {
 }
 
 /**
- * Commit id of a branch on the remote, empty when the branch does not exist.
+ * Refuses, before any change, a build parameter of an unexpected shape : branches, versions and git identity are put in shell commands.
+ */
+def validateParameters() {
+    def checks = [
+            [name: 'MONOREPO_BRANCH', value: env.MONOREPO_BRANCH, pattern: '[A-Za-z0-9][A-Za-z0-9._/-]*'],
+            [name: 'MASTER_BRANCH', value: env.MASTER_BRANCH, pattern: '[A-Za-z0-9][A-Za-z0-9._/-]*'],
+            [name: 'RELEASE_VERSION', value: params.RELEASE_VERSION, pattern: '[A-Za-z0-9][A-Za-z0-9._-]*'],
+            [name: 'PARENT_VERSION', value: params.PARENT_VERSION, pattern: '[A-Za-z0-9][A-Za-z0-9._-]*'],
+            [name: 'CORE_VERSION', value: params.CORE_VERSION, pattern: '[A-Za-z0-9][A-Za-z0-9._-]*'],
+            [name: 'NEXT_SNAPSHOT_VERSION', value: params.NEXT_SNAPSHOT_VERSION, pattern: '[A-Za-z0-9][A-Za-z0-9._-]*'],
+            [name: 'GIT_USER_NAME', value: params.GIT_USER_NAME, pattern: '[\\p{L}0-9 ._@-]+'],
+            [name: 'GIT_USER_EMAIL', value: params.GIT_USER_EMAIL, pattern: '[A-Za-z0-9._@+-]+'],
+    ]
+    def bad = checks.findAll { c -> c.value?.toString()?.trim() && !(c.value.toString().trim() ==~ c.pattern) }.collect { it.name }
+    if (bad) {
+        error("Unexpected value for ${bad.join(', ')} : refused before any change.")
+    }
+    // develop -> master, develop_core7 -> master_core7 : never merge a core line into the master of the other
+    def branch = env.MONOREPO_BRANCH ?: ''
+    def master = env.MASTER_BRANCH ?: ''
+    if (master && master == branch) {
+        error("MASTER_BRANCH ${master} is the release branch itself : refused before any change.")
+    }
+    // Only a stable release of all the modules merges into master (stagePromoteToMaster)
+    if (master && env.IS_PRERELEASE != 'true' && !isSingleModuleRelease() && branch.startsWith('develop') && master != branch.replaceFirst('^develop', 'master')) {
+        error("MASTER_BRANCH ${master} does not match the release branch ${branch} (expected ${branch.replaceFirst('^develop', 'master')}) : refused before any change.")
+    }
+}
+
+/**
+ * Writes a "mvn" wrapper, first on the PATH (RELEASER_BIN, see the Jenkinsfile), that runs Maven without the login and token parameters
+ * in its environment : a plugin or a test of the built POMs must never read them. git keeps them through GIT_ASKPASS.
+ */
+def writeMavenWrapper() {
+    // Maven is resolved by its Jenkins tool, by absolute path : a tools { maven } block would put the real mvn before the wrapper on the PATH
+    sh "rm -rf '${env.RELEASER_BIN}'"
+    def real = "${tool(name: params.MAVEN_TOOL, type: 'maven')}/bin/mvn".toString()
+    if (!fileExists(real)) {
+        error("mvn not found in the Maven tool '${params.MAVEN_TOOL}' (${real})")
+    }
+    sh "mkdir -p '${env.RELEASER_BIN}'"
+    writeFile file: "${env.RELEASER_BIN}/mvn", text: """#!/bin/sh
+exec env -u GITHUB_TOKEN -u GITLAB_TOKEN -u GITHUB_LOGIN -u GITLAB_LOGIN -u GIT_ASKPASS '${real}' "\$@"
+"""
+    sh "chmod 700 '${env.RELEASER_BIN}/mvn'"
+    // Self-check : every later "mvn" must be the wrapper, otherwise the tokens would reach Maven
+    def resolved = sh(script: "command -v mvn", returnStdout: true).trim()
+    if (resolved != "${env.RELEASER_BIN}/mvn".toString()) {
+        error("mvn resolves to '${resolved}' instead of the wrapper : the PATH of the job must not put another Maven first (no tools { maven } block)")
+    }
+}
+
+/**
+ * Lets an abort of the build (or a timeout) go through a catch that would otherwise go on.
+ */
+def rethrowIfAborted(Throwable e) {
+    if (e instanceof InterruptedException) {
+        throw e
+    }
+}
+
+/**
+ * Commit id of a branch on the remote, empty when the branch does not exist ; fails when the remote cannot be read.
  */
 def remoteBranchHead(String branch) {
-    return sh(script: "git ls-remote --heads origin '${branch}' | cut -f1", returnStdout: true).trim()
+    // A failed ls-remote must fail here, not read as a missing branch ; the full ref avoids matching xxx/<branch>
+    def head = sh(script: "out=\$(git ls-remote origin 'refs/heads/${branch}') || exit 1; printf '%s\\n' \"\$out\" | cut -f1", returnStdout: true).trim()
+    if (head.contains('\n')) {
+        error("Several heads found for branch ${branch} on the remote : refused")
+    }
+    return head
 }
 
 /**
@@ -349,6 +416,7 @@ def detectTargetJdk() {
             returnStdout: true
         ).trim()
     } catch (Throwable e) {
+        rethrowIfAborted(e)
         echo "WARNING: could not evaluate targetJdk with Maven: ${e.message}"
     }
 
@@ -400,6 +468,7 @@ def withJdk(String major, Closure body) {
     try {
         jdkHome = tool(name: toolName, type: 'jdk')
     } catch (Throwable e) {
+        rethrowIfAborted(e)
         echo "WARNING: Jenkins JDK tool '${toolName}' is not configured (${e.message})"
         echo "         -> using the build default JDK. Declare it in Manage Jenkins > Tools,"
         echo "            or remap it with the JDK_TOOL_MAP parameter."
@@ -590,14 +659,17 @@ def releaseTags() {
  * Nexus until every module is built. No -am : it would re-deploy release-test-lutece-parent.
  */
 def deployModules(List<String> modules) {
-    sh "git checkout --quiet --detach ${releaseTags()[0]}"
+    sh "git checkout --quiet --detach '${releaseTags()[0]}'"
     try {
         withJdk(env.PLATFORM_TARGET_JDK) {
             // Test platform only: never publish the release-test-* artifacts to the Lutece Nexus
             sh "mvn -s ${env.MAVEN_SETTINGS_XML} deploy -pl ${modules.join(',')} -DskipTests -DperformRelease=true -DdeployAtEnd=true -Dmaven.deploy.skip=true"
         }
     } finally {
-        sh "git checkout --quiet ${env.MONOREPO_BRANCH}"
+        // Never fails : a failed checkout after a successful deploy must not roll the publication back
+        if (sh(script: "git checkout --quiet --force '${env.MONOREPO_BRANCH}'", returnStatus: true) != 0) {
+            appendReport("  WARNING : could not go back to ${env.MONOREPO_BRANCH} after the deploy")
+        }
     }
 }
 
@@ -685,15 +757,16 @@ def stageInitialize() {
     env.MAVEN_SETTINGS_XML = "${WORKSPACE}/maven-settings.xml"
     echo "Maven settings provisioned: ${env.MAVEN_SETTINGS_XML}"
 
-    sh "git config user.email '${params.GIT_USER_EMAIL}'"
-    sh "git config user.name '${params.GIT_USER_NAME}'"
-
     // -- Lutece line (V7 / V8), release branch and JDK.
     //    The branch MUST be resolved before any checkout: the V7 line lives on
     //    develop_core7 and the V8 line on develop.
     env.LUTECE_MAJOR_RESOLVED = detectLuteceMajor()
     env.MONOREPO_BRANCH = resolveMonorepoBranch()
     env.MASTER_BRANCH = resolveMasterBranch()
+    validateParameters()
+    writeMavenWrapper()
+    sh "git config user.email '${params.GIT_USER_EMAIL}'"
+    sh "git config user.name '${params.GIT_USER_NAME}'"
     env.PLATFORM_TARGET_JDK = detectTargetJdk()
     env.PLATFORM_JDK_TOOL = jdkToolName(env.PLATFORM_TARGET_JDK)
 
@@ -707,7 +780,7 @@ def stageInitialize() {
     echo " targetJdk   : ${env.PLATFORM_TARGET_JDK} (Jenkins tool: ${env.PLATFORM_JDK_TOOL})"
     echo "=========================================="
 
-    sh "git checkout -B ${env.MONOREPO_BRANCH}"
+    sh "git checkout -B '${env.MONOREPO_BRANCH}'"
 
     if (!params.GITHUB_LOGIN?.trim() || !params.GITHUB_TOKEN?.toString()?.trim()) {
         error('GITHUB_LOGIN and GITHUB_TOKEN are required : the releaser sends the credentials of the person releasing, a manual build must type them.')
@@ -715,9 +788,11 @@ def stageInitialize() {
     writeAskpassScript()
     sh 'git remote set-url origin https://github.com/lutece-platform/release-test-lutece-platform.git'
     validateMasterBranch()
-    // Remote commits restored by rollbackPublication() if the publication fails
+    // Remote commit restored by rollbackPublication() if the publication fails ; master is read when it is merged
     env.BRANCH_HEAD_BEFORE = remoteBranchHead(env.MONOREPO_BRANCH)
-    env.MASTER_HEAD_BEFORE = env.MASTER_BRANCH ? remoteBranchHead(env.MASTER_BRANCH) : ''
+    if (!env.BRANCH_HEAD_BEFORE) {
+        error("Branch ${env.MONOREPO_BRANCH} not found on the remote : nothing to release from.")
+    }
 
     def pomContent = readFile('pom.xml')
     def currentVersion
@@ -757,6 +832,8 @@ def stageInitialize() {
     // each module is published under its own <lutece.{module}.version>. When
     // they disagree, the announced release version names no published
     // artifact, so make it loud rather than let it pass in a log line.
+    // Written to the report once it is created below
+    def versionWarning = null
     if (!isSingleModuleRelease() && params.RELEASE_VERSION?.trim()) {
         def declaredVersions = readJSON(text: env.MODULE_VERSIONS_JSON)
         def moduleBases = declaredVersions.collect { mod, info -> stripQualifier(info.current) } as Set
@@ -768,7 +845,7 @@ def stageInitialize() {
             echo "         To release the whole platform as ${baseVersion}, bump the 5"
             echo "         <lutece.*.version> properties and release-test-lutece-parent in pom.xml first,"
             echo "         then leave RELEASE_VERSION empty."
-            appendReport("WARNING: RELEASE_VERSION ${baseVersion} does not match the module versions ${moduleBases.join(', ')}")
+            versionWarning = "WARNING: RELEASE_VERSION ${baseVersion} does not match the module versions ${moduleBases.join(', ')}".toString()
             unstable("RELEASE_VERSION ${baseVersion} does not match the module versions ${moduleBases.join(', ')}")
         }
     }
@@ -805,6 +882,9 @@ Dry-Run      : ${params.DRY_RUN}
 ====================================
 
 """
+    if (versionWarning) {
+        appendReport(versionWarning)
+    }
 }
 
 /**
@@ -911,6 +991,10 @@ def stageValidateReleaseReadiness() {
                         'lutece.release-test-editorial-starter.version',
                         'lutece.release-test-lutece-starter.version',
                         'lutece.release-test-lutece-bom.version']
+    if (params.DRY_RUN && params.CORE_VERSION?.trim() && !params.CORE_VERSION.trim().endsWith('-SNAPSHOT')) {
+        // In dry run the core version chosen in the releaser is not written : the real run would replace this SNAPSHOT
+        ignoredProps << 'lutece.core.version'
+    }
     def violations = remainingSnapshots.findAll { !ignoredProps.contains(it.propertyName) }
 
     if (violations.size() > 0) {
@@ -1014,10 +1098,16 @@ def stagePromoteToMaster() {
         return
     }
 
-    sh "git fetch origin '${master}:${master}' || git branch '${master}' '${remoteMaster}'"
+    // Forced : a local master left ahead by a rolled back build must follow the remote again
+    sh "git fetch origin '+refs/heads/${master}:refs/heads/${master}'"
+    // Commit restored by rollbackPublication() : master as merged, so that a commit pushed during the build is never erased
+    env.MASTER_HEAD_BEFORE = sh(script: "git rev-parse 'refs/heads/${master}'", returnStdout: true).trim()
+    if (env.MASTER_HEAD_BEFORE != remoteMaster) {
+        error("Branch ${master} moved on the remote during the build : nothing was pushed, relaunch the release.")
+    }
     sh "git checkout '${master}'"
-    sh "git merge ${env.MONOREPO_BRANCH} -m \"Merge ${env.MONOREPO_BRANCH} for release ${env.RELEASE_TAGS}\""
-    sh "git checkout ${env.MONOREPO_BRANCH}"
+    sh "git merge '${env.MONOREPO_BRANCH}' -m \"Merge ${env.MONOREPO_BRANCH} for release ${env.RELEASE_TAGS}\""
+    sh "git checkout '${env.MONOREPO_BRANCH}'"
     env.MASTER_MERGED = 'true'
 
     appendReport("Merged into ${master} (local): ${env.RELEASE_TAGS}")
@@ -1067,7 +1157,22 @@ def stagePublish() {
         sh "git push --atomic origin ${refs.join(' ')}"
     } catch (Throwable e) {
         appendReport("FAILED Push: ${e.message}")
-        appendReport("  -> Atomic push : nothing was pushed nor deployed")
+        // The server may have accepted the push before the connection was lost : the tag tells, it is created by this build only and an
+        // annotated tag of the same name pushed by another build has another object id
+        def tag = releaseTags()[0]
+        def localTag = sh(script: "git rev-parse 'refs/tags/${tag}'", returnStdout: true).trim()
+        def remoteTag = null
+        try {
+            remoteTag = sh(script: "out=\$(git ls-remote origin 'refs/tags/${tag}') || exit 1; printf '%s\\n' \"\$out\" | cut -f1", returnStdout: true).trim()
+        } catch (Throwable r) {
+            appendReport("  -> Remote not readable : check by hand whether ${refs.join(', ')} were pushed")
+        }
+        if (remoteTag == localTag) {
+            appendReport("  -> The remote holds the release despite the error : rolled back, nothing deployed")
+            rollbackPublication()
+        } else if (remoteTag != null) {
+            appendReport("  -> Atomic push : nothing was pushed nor deployed")
+        }
         error("Failed to push ${refs.join(' ')}: ${e.message}")
     }
     appendReport("Pushed: ${refs.join(', ')}")

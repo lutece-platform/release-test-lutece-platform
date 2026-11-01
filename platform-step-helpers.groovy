@@ -12,6 +12,20 @@ import groovy.transform.Field
 // Lock of the reports between the parallel branches of a verification
 @Field def reportLock = [busy: false]
 
+// Only hosts the credentials are sent to, and the only repository hosts a plan may name
+@Field final String GITHUB_HOST = 'github.com'
+@Field final List GITLAB_HOSTS = ['dev.lutece.paris.fr']
+// Only repositories a plan may name : the Lutece organizations and the Lutece GitLab (same list as releaser.allowedRepositoryUrls)
+@Field final List ALLOWED_REPOSITORY_PREFIXES = ['https://github.com/lutece-platform/', 'https://github.com/lutece-secteur-public/',
+                                                 'https://github.com/citelibre/', 'https://dev.lutece.paris.fr/gitlab/']
+
+// Accepted shapes of the plan values interpolated into shell commands
+@Field final String SAFE_NAME = '[A-Za-z0-9][A-Za-z0-9._-]*'
+@Field final String SAFE_BRANCH = '[A-Za-z0-9][A-Za-z0-9._/-]*'
+@Field final String SAFE_COMMIT = '[0-9a-f]{7,40}'
+// Only this server id of the Maven settings, toward these hosts : its credentials must never be sent anywhere else
+@Field final String SAFE_DEPLOY_REPOSITORY = 'lutece_releases_private_repository::default::https://(piclutece-p30\\.apps\\.paris\\.mdp)/[A-Za-z0-9._/~-]+'
+
 // ========================================================================
 // Plan and report
 // ========================================================================
@@ -221,8 +235,9 @@ def markPomUpdated() {
  * target/ directory committed by mistake) never block a checkout nor end up in a release commit.
  */
 def cleanWorkTree(String workDir) {
+    // -x : ignored files too (target/, a planted source) ; .mvn : loaded by Maven before any goal, never part of a Lutece repository
     dir(workDir) {
-        sh 'git reset -q --hard HEAD && git clean -fdq'
+        sh 'git reset -q --hard HEAD && git clean -fdxq && rm -rf .mvn'
     }
 }
 
@@ -235,25 +250,92 @@ def cleanWorkTree(String workDir) {
  * a manual build types them. No credential is stored in Jenkins.
  */
 def credentialsFor(String scmUrl) {
-    def github = scmUrl.contains('github.com')
-    return [host : github ? 'GitHub' : 'GitLab',
+    def host = repositoryHost(scmUrl)
+    def github = host == GITHUB_HOST
+    return [host : github ? 'GitHub' : (host in GITLAB_HOSTS ? 'GitLab' : "unknown host '${host}'".toString()),
             login: github ? params.GITHUB_LOGIN : params.GITLAB_LOGIN,
             token: (github ? params.GITHUB_TOKEN : params.GITLAB_TOKEN)?.toString()]
 }
 
 /**
+ * Host of an https repository URL ("scm:git:" prefix accepted), empty when the URL is not of that shape.
+ */
+def repositoryHost(String scmUrl) {
+    def url = (scmUrl ?: '').replaceFirst('^scm:git:', '')
+    return url ==~ '^https://[A-Za-z0-9.-]+/.*' ? url.substring(8, url.indexOf('/', 8)).toLowerCase() : ''
+}
+
+/**
  * Writes the script git calls for a username or a password : it answers with the GITHUB_* or GITLAB_* build parameters, read from the
- * environment, according to the host named in the prompt. The token thus never appears in a command line, a URL or the clone
+ * environment, only for the exact hosts GITHUB_HOST and GITLAB_HOSTS named in the prompt ("Username for 'https://host': ", "Password for
+ * 'https://login@host': "), nothing for any other host. The token thus never appears in a command line, a URL or the clone
  * configuration ; GIT_ASKPASS points to this script and GIT_TERMINAL_PROMPT=0 forbids any interactive prompt.
  */
 def writeAskpassScript() {
-    writeFile file: env.GIT_ASKPASS, text: '''#!/bin/sh
-case "$1" in
-  *github.com*) [ "${1#Username}" != "$1" ] && printf '%s\\n' "$GITHUB_LOGIN" || printf '%s\\n' "$GITHUB_TOKEN" ;;
-  *)            [ "${1#Username}" != "$1" ] && printf '%s\\n' "$GITLAB_LOGIN" || printf '%s\\n' "$GITLAB_TOKEN" ;;
+    def gitlabPatterns = GITLAB_HOSTS.collect { "*\"'https://${it}'\"*|*\"'https://\"*\"@${it}'\"*" }.join('|')
+    writeFile file: env.GIT_ASKPASS, text: """#!/bin/sh
+case "\$1" in
+  *"'https://${GITHUB_HOST}'"*|*"'https://"*"@${GITHUB_HOST}'"*)[ "\${1#Username}" != "\$1" ] && printf '%s\\n' "\$GITHUB_LOGIN" || printf '%s\\n' "\$GITHUB_TOKEN" ;;
+  ${gitlabPatterns}) [ "\${1#Username}" != "\$1" ] && printf '%s\\n' "\$GITLAB_LOGIN" || printf '%s\\n' "\$GITLAB_TOKEN" ;;
+  *) printf '\\n' ;;
 esac
-'''
+"""
     sh "chmod 700 '${env.GIT_ASKPASS}'"
+}
+
+/**
+ * Writes a "mvn" wrapper, first on the PATH (RELEASER_BIN, see the Jenkinsfile), that runs Maven without the login and token parameters
+ * in its environment : Maven builds the POM of a repository as it is, and a plugin or a test of that POM must never read them. git keeps
+ * them through GIT_ASKPASS, and is never run by this wrapper.
+ */
+def writeMavenWrapper() {
+    // Maven is resolved by its Jenkins tool, by absolute path : a tools { maven } block would put the real mvn before the wrapper on the PATH
+    sh "rm -rf '${env.RELEASER_BIN}'"
+    def real = "${tool(name: params.MAVEN_TOOL, type: 'maven')}/bin/mvn".toString()
+    if (!fileExists(real)) {
+        error("mvn not found in the Maven tool '${params.MAVEN_TOOL}' (${real})")
+    }
+    sh "mkdir -p '${env.RELEASER_BIN}'"
+    writeFile file: "${env.RELEASER_BIN}/mvn", text: """#!/bin/sh
+exec env -u GITHUB_TOKEN -u GITLAB_TOKEN -u GITHUB_LOGIN -u GITLAB_LOGIN -u GIT_ASKPASS '${real}' "\$@"
+"""
+    sh "chmod 700 '${env.RELEASER_BIN}/mvn'"
+    // Self-check : every later "mvn" must be the wrapper, otherwise the tokens would reach Maven
+    def resolved = sh(script: "command -v mvn", returnStdout: true).trim()
+    if (resolved != "${env.RELEASER_BIN}/mvn".toString()) {
+        error("mvn resolves to '${resolved}' instead of the wrapper : the PATH of the job must not put another Maven first (no tools { maven } block)")
+    }
+}
+
+/**
+ * Fails when the files staged for a release commit are not the ones a release changes : the build of the previous resource ran the code
+ * of its repository, which could have altered this work tree. The POMs, the plugin descriptors and the AppInfo classes are the only files
+ * the version update touches.
+ */
+def checkStagedFiles(String workDir, resource) {
+    def staged = ''
+    def diff = ''
+    dir(workDir) {
+        staged = sh(script: "git diff --cached --name-only", returnStdout: true).trim()
+        diff = sh(script: "git diff --cached -U0 --no-color", returnStdout: true)
+    }
+    def unexpected = staged.readLines().findAll { f ->
+        !(f ==~ /(.*\/)?pom\.xml/ || f ==~ /.*\/WEB-INF\/plugins\/[^\/]+\.xml/ || f ==~ /.*\/WEB-INF\/conf\/plugins\/[^\/]+\.properties/
+          || f ==~ /.*\/AppInfo\.java/ || f ==~ /(.*\/)?core\.xml/)
+    }
+    if (unexpected) {
+        error("${coordinates(resource)} : files other than the version files are modified in the work tree, release refused : ${unexpected.join(', ')}")
+    }
+    // The content too : only version lines may change, a plugin or a dependency added by a tampered work tree must not be released
+    def properties = ((resource.versionUpdates?.properties ?: [:]).keySet() as List).collect { java.util.regex.Pattern.quote(it.toString()) }
+    // A trailing XML comment on a version line is tolerated : some POMs annotate their version
+    def allowed = [/^\s*<version>[^<]*<\/version>\s*(<!--.*-->)?\s*$/, /^\s*<[A-Za-z0-9._-]*[Vv]ersion>[^<]*<\/[A-Za-z0-9._-]*[Vv]ersion>\s*(<!--.*-->)?\s*$/,
+                   /^\s*(private\s+|public\s+)?(static\s+)?(final\s+)?String\s+APP_VERSION\s*=\s*"[^"]*"\s*;\s*$/, /^\s*[A-Za-z0-9._-]*version\s*=[^;{}]*$/]
+    properties.each { allowed << ("^\\s*<" + it + ">[^<]*</" + it + ">\\s*\$") }
+    def bad = diff.readLines().findAll { it ==~ /^[+-](?![+-]{2}).*/ }.collect { it.substring(1) }.findAll { l -> !allowed.any { l ==~ it } }
+    if (bad) {
+        error("${coordinates(resource)} : lines other than versions are modified in the work tree, release refused : ${bad.take(5).join(' | ')}")
+    }
 }
 
 /**
@@ -267,6 +349,72 @@ def checkCredentials(thePlan) {
     }.collect { r -> "${credentialsFor(r.scmUrl ?: '').host} (${r.artifactId})".toString() }.unique()
     if (missing) {
         error("Missing login or token for ${missing.join(', ')} : the releaser sends GITHUB_LOGIN/GITHUB_TOKEN and GITLAB_LOGIN/GITLAB_TOKEN from the credentials of the person releasing.")
+    }
+}
+
+/**
+ * Refuses a plan holding a value of an unexpected shape, before any clone : every value the pipeline puts in a shell command (names,
+ * versions, branches, tags, commits, repository URLs under ALLOWED_REPOSITORY_PREFIXES only, deploy repository) must match a strict pattern.
+ */
+def validatePlan(thePlan) {
+    def prefixes = ALLOWED_REPOSITORY_PREFIXES.collect { it.replace('.', '\\.') }.join('|')
+    // Plain path segments only : "..", "." or an empty segment would leave the organization once git normalizes the URL
+    def scmPattern = "(scm:git:)?(${prefixes})([A-Za-z0-9_-][A-Za-z0-9._-]*/)*[A-Za-z0-9_-][A-Za-z0-9._-]*/?".toString()
+    def coordinatesPattern = "${SAFE_NAME}:${SAFE_NAME}".toString()
+    def problems = []
+    def check = { String what, value, String pattern, boolean required ->
+        def text = value == null ? '' : value.toString()
+        if (!text) {
+            if (required) {
+                problems << "${what} missing".toString()
+            }
+        } else if (!(text ==~ pattern)) {
+            problems << "${what} '${text}'".toString()
+        }
+    }
+    def resources = (thePlan.components ?: []) + (thePlan.aggregate ? [thePlan.aggregate] : [])
+    for (def r : resources) {
+        def who = (r.artifactId ?: '?').toString()
+        check('artifactId', r.artifactId, SAFE_NAME, true)
+        check("groupId of ${who}", r.groupId, SAFE_NAME, true)
+        check("scmUrl of ${who}", r.scmUrl, scmPattern, true)
+        check("branch of ${who}", r.branch, SAFE_BRANCH, true)
+        check("masterBranch of ${who}", r.masterBranch, SAFE_BRANCH, false)
+        check("targetVersion of ${who}", r.targetVersion, SAFE_NAME, !isPrecheck())
+        // The current version is put in a shell command by the precheck only (tags of the untested commits)
+        check("currentVersion of ${who}", r.currentVersion, SAFE_NAME, isPrecheck())
+        for (def field : ['nextSnapshotVersion', 'parentVersion', 'versionProperty', 'sourceTag']) {
+            check("${field} of ${who}", r[field], SAFE_NAME, false)
+        }
+        check("verifiedCommit of ${who}", r.verifiedCommit, SAFE_COMMIT, false)
+        check("deployRepository of ${who}", r.deployRepository, SAFE_DEPLOY_REPOSITORY, false)
+        def updates = r.versionUpdates ?: [:]
+        (updates.properties ?: [:]).each { name, version ->
+            check('version property', name, SAFE_NAME, true)
+            check("value of ${name}", version, SAFE_NAME, true)
+        }
+        (updates.dependencies ?: [:]).each { coords, version ->
+            check('dependency', coords, coordinatesPattern, true)
+            check("version of ${coords}", version, SAFE_NAME, true)
+        }
+    }
+    for (def coords : (thePlan.campaignCoordinates ?: [])) {
+        check('campaign coordinates', coords, coordinatesPattern, true)
+    }
+    check('GIT_USER_NAME', params.GIT_USER_NAME, '[\\p{L}0-9 ._@-]+', false)
+    check('GIT_USER_EMAIL', params.GIT_USER_EMAIL, '[A-Za-z0-9._@+-]+', false)
+    if (problems) {
+        appendReport("Plan rejected before any change, unexpected values : ${problems.join(' ; ')}")
+        error("Plan rejected, unexpected values : ${problems.join(' ; ')}")
+    }
+}
+
+/**
+ * Fails when a tag name read from a repository has an unexpected shape : it is then put in shell commands.
+ */
+def checkTagName(String tag) {
+    if (tag && !(tag ==~ SAFE_NAME)) {
+        error("Unexpected tag name '${tag}' in the repository : refused")
     }
 }
 
@@ -308,6 +456,7 @@ def detectTargetJdk(String workDir) {
                 returnStdout: true
             ).trim()
         } catch (Throwable e) {
+            rethrowIfAborted(e)
             echo "WARNING: could not evaluate targetJdk with Maven: ${e.message}"
         }
     }
@@ -343,6 +492,7 @@ def withJdk(String major, Closure body) {
     try {
         jdkHome = tool(name: toolName, type: 'jdk')
     } catch (Throwable e) {
+        rethrowIfAborted(e)
         echo "WARNING: Jenkins JDK tool '${toolName}' is not configured (${e.message}) -> using the build default JDK"
         body()
         return
@@ -383,7 +533,7 @@ def setResourceVersion(String workDir, resource, String version) {
                 sed -i '0,/<version>[^<]*<\\/version>/s||<version>${version}</version>|' webapp/WEB-INF/conf/core.xml
             fi
             if [ -f src/java/fr/paris/lutece/portal/service/init/AppInfo.java ]; then
-                sed -i -E '/VERSION[[:space:]]*=/ s|"[^"]*"|"${version}"|' src/java/fr/paris/lutece/portal/service/init/AppInfo.java
+                sed -i -E '/private static final String APP_VERSION[[:space:]]*=/ s|"[^"]*"|"${version}"|' src/java/fr/paris/lutece/portal/service/init/AppInfo.java
             fi
         """
     }
@@ -403,7 +553,7 @@ def deployTarget(resource) {
     if (resource.deployRepository) {
         return 'private repository'
     }
-    return resource.scmUrl.contains('github.com') ? 'public repository' : 'private repository NOT CONFIGURED'
+    return repositoryHost(resource.scmUrl) == GITHUB_HOST ? 'public repository' : 'private repository NOT CONFIGURED'
 }
 
 // ========================================================================
@@ -443,7 +593,8 @@ def remoteBranchSha(String workDir, String scmUrl, String branch) {
     def sha = ''
     withRepositoryUrl(scmUrl) { authUrl ->
         dir(workDir) {
-            sha = sh(script: "git ls-remote \"${authUrl}\" 'refs/heads/${branch}' | cut -f1", returnStdout: true).trim()
+            // A failed ls-remote must fail here, not read as a missing branch
+            sha = sh(script: "out=\$(git ls-remote \"${authUrl}\" 'refs/heads/${branch}') || exit 1; printf '%s\\n' \"\$out\" | cut -f1", returnStdout: true).trim()
         }
     }
     return sha
@@ -506,8 +657,19 @@ def mustCheckPrereleases(boolean isAggregate) {
 def declaredVersions(String workDir) {
     def versions = []
     dir(workDir) {
-        def parentVersion = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.version -DforceStdout 2>/dev/null | tail -1 || true", returnStdout: true).trim()
-        def declared = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null || true", returnStdout: true)
+        def parentVersion = ''
+        def declared = ''
+        // A Maven failure must fail the check : an empty answer would let every SNAPSHOT, beta or RC through
+        try {
+            parentVersion = sh(script: "out=\$(mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.version -DforceStdout 2>/dev/null) || exit 1; printf '%s\\n' \"\$out\" | tail -1", returnStdout: true).trim()
+            declared = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null", returnStdout: true)
+        } catch (Throwable e) {
+            rethrowIfAborted(e)
+            error("Maven could not read the declared versions of the POM (help:evaluate failed) : SNAPSHOT, beta and RC dependencies not checked")
+        }
+        if (parentVersion.startsWith('[ERROR]')) {
+            error("Maven could not read the parent of the POM : ${parentVersion}")
+        }
         def dependencies = [] as Set
         def current = [:]
         declared.readLines().each { line ->
@@ -535,10 +697,11 @@ def snapshotProblems(List declared) {
 }
 
 /**
- * The beta and RC artifacts among the declared versions (x.y.z-beta-NN, x.y.z-RC-NN, or a bare -beta / -RC). Empty when the POM declares none.
+ * The beta and RC artifacts among the declared versions (x.y.z-beta-NN, x.y.z-RC-NN, a bare -beta / -RC, or the -RC1 / -beta.2 forms of
+ * other projects). Empty when the POM declares none.
  */
 def prereleaseProblems(List declared) {
-    return declared.findAll { it ==~ /(?i).*-(beta|rc)(-\d+)?/ }
+    return declared.findAll { it ==~ /(?i).*[-.](beta|rc)([-.]?\d+)?/ }
 }
 
 /**
@@ -576,9 +739,9 @@ def checkCompiles(String workDir, resource) {
 
 /**
  * Releases a resource cloned in a directory in the order of the releaser workflow : everything Git first (release commit and tag pushed,
- * tag merged into the master branch for a stable version, next snapshot pushed), the Nexus deploy from the tag LAST. Any failure rolls the
- * repository back like the releaser does (release branch and master branch force-pushed to their commits of before the release, tag
- * deleted) : as nothing is in Nexus before the last command, the same version can be released again. The release commit is compiled
+ * tag merged into the master branch for a stable version, next snapshot pushed), the Nexus deploy from the tag LAST (deployAtEnd). Any
+ * failure rolls back what this build pushed (see rollbackResource) : as nothing is in Nexus before the last command, the same version can
+ * be released again. The master branch is checked before any push. The release commit is compiled
  * before any push. The resource is recorded in the report once deployed. In dry run the local part runs, compilation included, and the
  * publication is only logged. A resource with a sourceTag is released from that beta or RC tag : only the release tag is pushed, then the
  * branch gets the next snapshot and an "ours" merge of the release tag, so that its later releases merge into master without conflict.
@@ -589,8 +752,19 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     def sourceTag = resource.sourceTag ? resource.sourceTag.toString() : ''
     echo "=== Releasing ${coordinates(resource)} ${resource.currentVersion} -> ${resource.targetVersion} (branch ${resource.branch}, tag ${tag}${sourceTag ? ', from ' + sourceTag : ''}) ==="
 
-    if (!isDryRun() && !resource.deployRepository && !resource.scmUrl.contains('github.com')) {
-        error("${coordinates(resource)} : no private Nexus repository in the plan for a GitLab resource, release refused before any change.")
+    // In dry run, what a real release would refuse is reported and the resource is not counted as publishable
+    def dryRunRefusals = []
+    if (!resource.deployRepository && repositoryHost(resource.scmUrl) != GITHUB_HOST) {
+        if (!isDryRun()) {
+            error("${coordinates(resource)} : no private Nexus repository in the plan for a GitLab resource, release refused before any change.")
+        }
+        dryRunRefusals << 'no private Nexus repository in the plan for a GitLab resource'
+    }
+    if (resource.masterBranch && !remoteBranchSha(workDir, resource.scmUrl, resource.masterBranch)) {
+        if (!isDryRun()) {
+            error("Branch ${resource.masterBranch} not found on ${resource.scmUrl} : cannot merge ${tag} into it, release refused before any change.")
+        }
+        dryRunRefusals << "branch ${resource.masterBranch} not found, ${tag} could not be merged into it"
     }
     if (sourceTag) {
         if (!isAggregate) {
@@ -613,11 +787,18 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
     }
     setResourceVersion(workDir, resource, resource.targetVersion)
     checkReleaseDependencies(workDir, resource, isAggregate)
+    // In a release the tag must not exist yet : a push rejected for that reason would otherwise be read as a tag of this build
+    if (!isDryRun()) {
+        checkTagAbsent(workDir, resource)
+    }
     def releaseSha = ''
     def releaseMessage = sourceTag ? "release: ${tag} (from ${sourceTag})" : "release: ${tag}"
     dir(workDir) {
+        sh 'git add -u'
+    }
+    checkStagedFiles(workDir, resource)
+    dir(workDir) {
         sh """
-            git add -u
             git diff --cached --quiet && echo 'Version already at ${resource.targetVersion} — nothing to commit' || git commit -m "${releaseMessage}"
             git tag -fa '${tag}' -m "Release ${resource.artifactId} ${resource.targetVersion}"
         """
@@ -638,12 +819,16 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             echo "[DRY-RUN] Would merge ${tag} into ${resource.branch} keeping its content (ours), then push ${resource.branch}"
         }
         echo "[DRY-RUN] Would deploy ${coordinates(resource)}:${resource.targetVersion} to Nexus (${deployTarget(resource)}) from ${tag}"
+        if (dryRunRefusals) {
+            error("[DRY-RUN] a real release would be refused : ${dryRunRefusals.join(' ; ')}")
+        }
         recordReleased(resource, isAggregate)
         return
     }
 
     def originSha = readFile("${workDir}/.git/releaser-origin-sha").trim()
-    def originMasterSha = resource.masterBranch ? remoteBranchSha(workDir, resource.scmUrl, resource.masterBranch) : ''
+    // What this build actually pushed : the rollback only undoes that, and only if nobody pushed since
+    def published = [branch: '', master: '', masterBefore: '', tag: false, deploy: false]
 
     try {
         withRepositoryUrl(resource.scmUrl) { authUrl ->
@@ -651,27 +836,25 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
                 if (sourceTag) {
                     runLogged(resource, "Push of tag ${tag}", "git push \"${authUrl}\" 'refs/tags/${tag}'")
                 } else {
-                    runLogged(resource, "Push of ${resource.branch} and tag ${tag}", """
-                        git push "${authUrl}" '${resource.branch}'
-                        git push "${authUrl}" 'refs/tags/${tag}'
-                    """)
+                    runLogged(resource, "Push of ${resource.branch} and tag ${tag} (atomic)", "git push --atomic \"${authUrl}\" '${resource.branch}' 'refs/tags/${tag}'")
+                    published.branch = sh(script: "git rev-parse 'refs/heads/${resource.branch}'", returnStdout: true).trim()
                 }
+                published.tag = true
             }
         }
 
         if (resource.masterBranch) {
-            if (!originMasterSha) {
-                error("Branch ${resource.masterBranch} not found on ${resource.scmUrl} : cannot merge ${tag} into it.")
-            }
             withRepositoryUrl(resource.scmUrl) { authUrl ->
                 dir(workDir) {
+                    runLogged(resource, "Fetch of ${resource.masterBranch}", "git fetch \"${authUrl}\" '${resource.masterBranch}:${resource.masterBranch}'")
+                    published.masterBefore = sh(script: "git rev-parse 'refs/heads/${resource.masterBranch}'", returnStdout: true).trim()
                     runLogged(resource, "Merge of ${tag} into ${resource.masterBranch}", """
-                        git fetch "${authUrl}" '${resource.masterBranch}:${resource.masterBranch}'
                         git checkout '${resource.masterBranch}'
                         git merge -m "Merge ${tag} into ${resource.masterBranch}" '${tag}^{commit}'
                         git push "${authUrl}" '${resource.masterBranch}'
-                        git checkout '${resource.branch}'
                     """)
+                    published.master = sh(script: "git rev-parse 'refs/heads/${resource.masterBranch}'", returnStdout: true).trim()
+                    sh "git checkout -q '${resource.branch}'"
                 }
             }
         }
@@ -683,8 +866,11 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             if (isAggregate) {
                 applyVersionUpdates(workDir, resource, " on ${resource.branch}")
                 dir(workDir) {
+                    sh 'git add -u'
+                }
+                checkStagedFiles(workDir, resource)
+                dir(workDir) {
                     sh """
-                        git add -u
                         git diff --cached --quiet && echo '${resource.branch} already up to date — nothing to commit' || git commit -m "chore: update versions on ${resource.branch} after the release of ${tag}"
                     """
                 }
@@ -692,13 +878,17 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         }
         if (resource.nextSnapshotVersion) {
             setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
+            dir(workDir) {
+                sh 'git add -u'
+            }
+            checkStagedFiles(workDir, resource)
             withRepositoryUrl(resource.scmUrl) { authUrl ->
                 dir(workDir) {
                     runLogged(resource, "Next development version ${resource.nextSnapshotVersion}", """
-                        git add -u
                         git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
                         git push "${authUrl}" '${resource.branch}'
                     """)
+                    published.branch = sh(script: "git rev-parse 'refs/heads/${resource.branch}'", returnStdout: true).trim()
                 }
             }
         }
@@ -709,18 +899,38 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
                         git merge -s ours -m "Merge ${tag} into ${resource.branch} (content of ${resource.branch} kept)" '${tag}^{commit}'
                         git push "${authUrl}" '${resource.branch}'
                     """)
+                    published.branch = sh(script: "git rev-parse 'refs/heads/${resource.branch}'", returnStdout: true).trim()
                 }
             }
         }
 
         dir(workDir) {
             sh "git checkout -q 'refs/tags/${tag}'"
+        }
+        // The deployed artifact must be the exact content of the tag : nothing untracked, ignored or planted by an earlier build
+        cleanWorkTree(workDir)
+        dir(workDir) {
             def altRepository = resource.deployRepository ? " -DaltReleaseDeploymentRepository='${resource.deployRepository}'" : ''
-            runLogged(resource, "Nexus deploy from ${tag} (${deployTarget(resource)})", "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true${altRepository}")
+            published.deploy = true
+            // deployAtEnd : nothing reaches Nexus until every module is built
+            runLogged(resource, "Nexus deploy from ${tag} (${deployTarget(resource)})", "mvn -s ${env.MAVEN_SETTINGS_XML} clean deploy -DskipTests -DperformRelease=true -DdeployAtEnd=true${altRepository}")
         }
     } catch (Throwable e) {
-        rollbackResource(workDir, resource, tag, releaseSha, originSha, originMasterSha)
-        throw e
+        // The rollback runs to its end even on an abort, but the abort then wins over the original failure
+        def toThrow = e
+        try {
+            reconcilePublished(workDir, resource, tag, originSha, published)
+            rollbackResource(workDir, resource, tag, releaseSha, originSha, published)
+        } catch (Throwable r) {
+            echo "Rollback of ${coordinates(resource)} interrupted : ${r.message ?: r.class.simpleName}"
+            if (r instanceof InterruptedException) {
+                toThrow = r
+            }
+        }
+        if (published.deploy) {
+            appendReport("${coordinates(resource)} : the Nexus deploy failed, artifacts already sent, if any, must be removed by hand before releasing ${resource.targetVersion} again")
+        }
+        throw toThrow
     }
 
     recordReleased(resource, isAggregate)
@@ -732,39 +942,92 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
 }
 
 /**
- * Rolls a failed release back, as GitResourceService.rollbackRelease does in the releaser : the release branch and the master branch are
- * force-pushed to their commits of before the release, the tag is deleted when it still points to the release commit. Every command is
- * attempted even if a previous one fails, and the outcome goes to the report.
+ * Completes what this build pushed after a failed push : the server may have accepted a push before the connection was lost. A remote
+ * branch on the local commit of this build, or the release tag on the remote (absent before, see checkTagAbsent), was pushed by it.
  */
-def rollbackResource(String workDir, resource, String tag, String releaseSha, String originSha, String originMasterSha) {
+def reconcilePublished(String workDir, resource, String tag, String originSha, Map published) {
+    def localSha = { String branch ->
+        def sha = ''
+        dir(workDir) {
+            sha = sh(script: "git rev-parse --verify -q 'refs/heads/${branch}' || true", returnStdout: true).trim()
+        }
+        return sha
+    }
+    try {
+        def branchLocal = localSha(resource.branch)
+        // A new local commit present on the remote can only have been pushed by this build, also after a first push of the branch
+        if (branchLocal && branchLocal != originSha && branchLocal != published.branch && remoteBranchSha(workDir, resource.scmUrl, resource.branch) == branchLocal) {
+            published.branch = branchLocal
+        }
+        if (resource.masterBranch && published.masterBefore && !published.master) {
+            def masterLocal = localSha(resource.masterBranch)
+            if (masterLocal && masterLocal != published.masterBefore && remoteBranchSha(workDir, resource.scmUrl, resource.masterBranch) == masterLocal) {
+                published.master = masterLocal
+            }
+        }
+        if (!published.tag) {
+            withRepositoryUrl(resource.scmUrl) { authUrl ->
+                dir(workDir) {
+                    def remoteTag = sh(script: "out=\$(git ls-remote \"${authUrl}\" 'refs/tags/${tag}') || exit 1; printf '%s\\n' \"\$out\" | cut -f1", returnStdout: true).trim()
+                    published.tag = remoteTag as boolean
+                }
+            }
+        }
+    } catch (Throwable r) {
+        rethrowIfAborted(r)
+        appendReport("${coordinates(resource)} : remote not readable after the failure, check by hand whether ${resource.branch}, ${resource.masterBranch ?: '-'} and ${tag} were pushed")
+    }
+}
+
+/**
+ * Rolls a failed release back, as GitResourceService.rollbackRelease does in the releaser, but only what this build pushed : the release
+ * branch and the master branch go back to their commits of before the release by a protected force push (--force-with-lease on the commit
+ * this build pushed : a commit pushed by someone else since is never erased), the tag is deleted when it still points to the release
+ * commit. Every command is attempted even if a previous one fails, and the outcome goes to the report.
+ */
+def rollbackResource(String workDir, resource, String tag, String releaseSha, String originSha, Map published) {
     echo "=== Rolling back ${coordinates(resource)} ${resource.targetVersion} ==="
     def done = []
     def failed = []
     withRepositoryUrl(resource.scmUrl) { authUrl ->
         dir(workDir) {
-            if (sh(script: "git push --force \"${authUrl}\" '${originSha}:refs/heads/${resource.branch}'", returnStatus: true) == 0) {
-                done << "${resource.branch} reset to ${shortSha(originSha)}"
-            } else {
-                failed << "${resource.branch} NOT reset to ${shortSha(originSha)}"
-            }
-            if (originMasterSha) {
-                if (sh(script: "git push --force \"${authUrl}\" '${originMasterSha}:refs/heads/${resource.masterBranch}'", returnStatus: true) == 0) {
-                    done << "${resource.masterBranch} reset to ${shortSha(originMasterSha)}"
+            if (published.branch) {
+                if (sh(script: "git push --force-with-lease='refs/heads/${resource.branch}:${published.branch}' \"${authUrl}\" '${originSha}:refs/heads/${resource.branch}'", returnStatus: true) == 0) {
+                    done << "${resource.branch} reset to ${shortSha(originSha)}"
                 } else {
-                    failed << "${resource.masterBranch} NOT reset to ${shortSha(originMasterSha)}"
+                    failed << "${resource.branch} NOT reset to ${shortSha(originSha)} (changed on the remote since the release, or push refused)"
                 }
             }
-            def remoteTagSha = sh(script: "git ls-remote \"${authUrl}\" 'refs/tags/${tag}^{}' | cut -f1", returnStdout: true).trim()
-            if (!remoteTagSha) {
-                done << "tag ${tag} not on the remote"
-            } else if (remoteTagSha == releaseSha) {
-                if (sh(script: "git push \"${authUrl}\" ':refs/tags/${tag}'", returnStatus: true) == 0) {
-                    done << "tag ${tag} deleted"
+            if (published.master) {
+                if (sh(script: "git push --force-with-lease='refs/heads/${resource.masterBranch}:${published.master}' \"${authUrl}\" '${published.masterBefore}:refs/heads/${resource.masterBranch}'", returnStatus: true) == 0) {
+                    done << "${resource.masterBranch} reset to ${shortSha(published.masterBefore)}"
                 } else {
-                    failed << "tag ${tag} NOT deleted"
+                    failed << "${resource.masterBranch} NOT reset to ${shortSha(published.masterBefore)} (changed on the remote since the release, or push refused)"
                 }
-            } else {
-                failed << "tag ${tag} kept : it does not point to the release commit"
+            }
+            if (published.tag) {
+                def remoteTagSha = null
+                try {
+                    remoteTagSha = sh(script: "out=\$(git ls-remote \"${authUrl}\" 'refs/tags/${tag}^{}') || exit 1; printf '%s\\n' \"\$out\" | cut -f1", returnStdout: true).trim()
+                } catch (Throwable e) {
+                    failed << "tag ${tag} : remote not readable, check it by hand"
+                }
+                if (remoteTagSha == null) {
+                    // already reported
+                } else if (!remoteTagSha) {
+                    done << "tag ${tag} not on the remote"
+                } else if (remoteTagSha == releaseSha) {
+                    if (sh(script: "git push \"${authUrl}\" ':refs/tags/${tag}'", returnStatus: true) == 0) {
+                        done << "tag ${tag} deleted"
+                    } else {
+                        failed << "tag ${tag} NOT deleted"
+                    }
+                } else {
+                    failed << "tag ${tag} kept : it does not point to the release commit"
+                }
+            }
+            if (!published.branch && !published.master && !published.tag) {
+                done << 'nothing was pushed'
             }
         }
     }
@@ -787,14 +1050,24 @@ def writeVerifyReport(report) {
 }
 
 /**
+ * Lets an abort of the build (or a timeout) go through a catch that would otherwise go on with the next resource.
+ */
+def rethrowIfAborted(Throwable e) {
+    if (e instanceof InterruptedException) {
+        throw e
+    }
+}
+
+/**
  * Runs one check and returns its result : OK, or the given failure status (TO_FIX or WARNING) with the error lines. A failed check never
- * stops the verification of the other checks nor of the other resources.
+ * stops the verification of the other checks nor of the other resources, an abort of the build does.
  */
 def runCheck(String check, String failureStatus, Closure body) {
     try {
         body()
         return [check: check, status: 'OK', details: '']
     } catch (Throwable e) {
+        rethrowIfAborted(e)
         echo "Check '${check}' : ${failureStatus} — ${e.message}"
         return [check: check, status: failureStatus, details: (e.message ?: e.class.simpleName).toString()]
     }
@@ -859,6 +1132,7 @@ def checkSomethingToRelease(String workDir, resource) {
         if (!tag) {
             return
         }
+        checkTagName(tag)
         if (realCommitsSince(tag).isEmpty()) {
             error("Nothing to release : no commit since ${tag}")
         }
@@ -873,10 +1147,11 @@ def checkUntestedCommits(String workDir, resource, String version, result) {
     def base = version.replaceFirst(/-SNAPSHOT$/, '')
     dir(workDir) {
         def patterns = ["${resource.artifactId}-${base}", "v${base}"].collect { "'refs/tags/${it}-beta-*' 'refs/tags/${it}-RC-*'" }.join(' ')
-        def tag = sh(script: "git for-each-ref --sort=-creatordate --count=1 --format='%(refname:short)' ${patterns}", returnStdout: true).trim()
+        def tag = sh(script: "git for-each-ref --sort=-creatordate --count=1 --format='%(refname:lstrip=2)' ${patterns}", returnStdout: true).trim()
         if (!tag) {
             return
         }
+        checkTagName(tag)
         def commits = realCommitsSince(tag)
         if (!commits.isEmpty()) {
             result.untestedSinceTag = tag
@@ -887,10 +1162,11 @@ def checkUntestedCommits(String workDir, resource, String version, result) {
 }
 
 /**
- * The subjects of the commits since a tag, in the current directory, but the merges and the ones written by the releases.
+ * The subjects of the commits since a tag, in the current directory, but the merges and the ones written by the releases : the
+ * releaser, the step pipeline and the release pipeline. Other "chore: ..." commits are real commits.
  */
 def realCommitsSince(String tag) {
-    def log = sh(script: "git log --no-merges --format=%s '${tag}..HEAD' | grep -v -E '^(\\[(maven-release-plugin|site-release|release-from-tag)\\]|release: |chore: )' || true", returnStdout: true)
+    def log = sh(script: "git log --no-merges --format=%s '${tag}..HEAD' | grep -v -E '^(\\[(maven-release-plugin|site-release|release-from-tag)\\]|release: |chore: (prepare next development iteration|update versions|restore SNAPSHOT))' || true", returnStdout: true)
     return log.readLines().findAll { it.trim() }
 }
 
@@ -936,7 +1212,7 @@ def checkTagAbsent(String workDir, resource) {
     def sha = ''
     withRepositoryUrl(resource.scmUrl) { authUrl ->
         dir(workDir) {
-            sha = sh(script: "git ls-remote \"${authUrl}\" 'refs/tags/${tag}' | cut -f1", returnStdout: true).trim()
+            sha = sh(script: "out=\$(git ls-remote \"${authUrl}\" 'refs/tags/${tag}') || exit 1; printf '%s\\n' \"\$out\" | cut -f1", returnStdout: true).trim()
         }
     }
     if (sha) {
@@ -1074,6 +1350,14 @@ def withReportLock(Closure body) {
 }
 
 /**
+ * Result of a resource whose verification failed outside its checks (clone, JDK, work tree) : to fix, with the error.
+ */
+def verificationError(resource, Throwable e) {
+    return [status: 'TO_FIX', version: isPrecheck() ? resource.currentVersion : resource.targetVersion, commit: '',
+            checks: [[check: 'verification', status: 'TO_FIX', details: "Verification interrupted : ${e.message ?: e.class.simpleName}".toString()]]]
+}
+
+/**
  * Verifies the components, by N workers taking the next one from a shared queue. The verification report and the step report are
  * written under the lock, as several branches end at the same time.
  */
@@ -1083,7 +1367,14 @@ def verifyComponents(components, report) {
     def worker = {
         while (!queue.isEmpty()) {
             def component = queue.remove(0)
-            def result = verifyResource(component, false)
+            def result
+            try {
+                result = verifyResource(component, false)
+            } catch (Throwable e) {
+                rethrowIfAborted(e)
+                // An error outside the checks still gives the component a result, and the other workers go on
+                result = verificationError(component, e)
+            }
             withReportLock {
                 report.components[coordinates(component)] = result
                 writeVerifyReport(report)
@@ -1115,7 +1406,13 @@ def stageVerifyComponents() {
     writeVerifyReport(report)
     verifyComponents(thePlan.components, report)
     if (thePlan.aggregate) {
-        def result = verifyResource(thePlan.aggregate, true)
+        def result
+        try {
+            result = verifyResource(thePlan.aggregate, true)
+        } catch (Throwable e) {
+            rethrowIfAborted(e)
+            result = verificationError(thePlan.aggregate, e)
+        }
         result.coordinates = coordinates(thePlan.aggregate)
         report.aggregate = result
         writeVerifyReport(report)
@@ -1205,16 +1502,22 @@ def stageInitialize() {
     env.PLAN_JSON = params.RELEASE_PLAN
     env.STEP_MODE = planMode(thePlan)
     env.DRY_RUN = env.STEP_MODE == 'DRY_RUN' ? 'true' : 'false'
-    checkCredentials(thePlan)
+    sh "rm -rf '${env.WORK_DIR}' && mkdir -p '${env.WORK_DIR}'"
+    writeReport([releasedVersions: [:], failedVersions: [:], notProcessed: [], pomUpdated: false, aggregateVersion: null, report: ''])
+    validatePlan(thePlan)
+    try {
+        checkCredentials(thePlan)
+    } catch (e) {
+        appendReport("Plan rejected before any change : ${e.message}")
+        throw e
+    }
     writeAskpassScript()
+    writeMavenWrapper()
 
     configFileProvider([configFile(fileId: params.MAVEN_SETTINGS_ID, variable: 'MVN_SETTINGS_TMP')]) {
         sh "cp \${MVN_SETTINGS_TMP} ${WORKSPACE}/maven-settings.xml"
     }
     env.MAVEN_SETTINGS_XML = "${WORKSPACE}/maven-settings.xml"
-
-    sh "rm -rf '${env.WORK_DIR}' && mkdir -p '${env.WORK_DIR}'"
-    writeReport([releasedVersions: [:], failedVersions: [:], notProcessed: [], pomUpdated: false, aggregateVersion: null, report: ''])
 
     echo "=========================================="
     echo " Lutece Platform Step Pipeline"
@@ -1253,6 +1556,7 @@ def stageReleaseComponents() {
                 releaseResource(workDir, component, false)
             }
         } catch (Throwable e) {
+            rethrowIfAborted(e)
             echo "Release of ${coordinates(component)} failed : ${e.message}"
             recordFailed(component, (e.message ?: e.class.simpleName).toString())
         }
@@ -1288,8 +1592,11 @@ def updateAggregatePom(aggregate) {
     applyVersionUpdates(workDir, aggregate)
 
     dir(workDir) {
+        sh 'git add -u'
+    }
+    checkStagedFiles(workDir, aggregate)
+    dir(workDir) {
         sh """
-            git add -u
             git diff --cached --quiet && echo 'Aggregate POM already up to date — nothing to commit' || git commit -m "chore: update versions for the release of ${aggregate.artifactId} ${aggregate.targetVersion}"
         """
     }
@@ -1356,7 +1663,7 @@ def stageReport() {
     }
     def lines = []
     lines.add("STEP FAILED : ${failed.size()} component(s) could not be released.${isDryRun() ? ' [DRY-RUN : nothing was pushed nor published]' : ''}".toString())
-    lines.add('  Failed (nothing published ; error lines and rollback above) :')
+    lines.add('  Failed (rolled back in git ; error lines, rollback and Nexus state above) :')
     failed.each { coords, reason -> lines.add("    - ${coords} : ${reason}".toString()) }
     lines.add(isDryRun() ? '  Would be published (in Nexus, referenced by the aggregate POM) :' : '  Published (in Nexus, referenced by the aggregate POM) :')
     if (released.isEmpty()) {
@@ -1379,8 +1686,22 @@ def stageReport() {
  */
 def postFailure() {
     try {
+        if (isVerify()) {
+            appendReport("FAILED at ${new Date()} : verification interrupted, the resources missing from the verification report were not verified. Nothing was committed nor pushed.")
+            return
+        }
+        def report = readReport()
+        if (!report.notProcessed) {
+            def released = report.releasedVersions ?: [:]
+            def failed = report.failedVersions ?: [:]
+            report.notProcessed = plan().components.findAll { !released.containsKey(coordinates(it)) && !failed.containsKey(coordinates(it)) }
+                    .collect { coordinates(it) }
+            writeReport(report)
+        }
         if (!hasFailures()) {
-            appendReport("FAILED at ${new Date()} : the resources listed in releasedVersions were released, the others were not. Prepare the step again in the releaser to release the remaining ones.")
+            def released = report.releasedVersions ?: [:]
+            appendReport(released ? "FAILED at ${new Date()} : the resources listed in releasedVersions were released, the others were not. Prepare the step again in the releaser to release the remaining ones."
+                                  : "FAILED at ${new Date()} : nothing was released. See the lines above for the cause.")
         }
     } catch (Throwable e) {
         echo "Could not complete the report : ${e.message}"

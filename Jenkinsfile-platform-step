@@ -19,8 +19,8 @@
  *   { releasedVersions : {"groupId:artifactId" : version}, aggregateVersion, report }
  *
  * Rules :
- *  - fail-fast : the first failing component stops the build, the aggregate is
- *    never touched before all its components are released ;
+ *  - a failing component is rolled back and the others go on ; the aggregate is
+ *    never touched when a component failed ;
  *  - per resource, everything runs locally first (tests, version, commit, tag)
  *    and is published in one go (push, Nexus deploy, master merge, next snapshot) ;
  *  - dryRun = true : nothing is pushed, deployed or merged ;
@@ -46,8 +46,8 @@ pipeline {
 
     // Bootstrap toolchain only : each resource is built with the JDK matching
     // its own POM (targetJdk), see helpers.withJdk / JDK_TOOL_MAP.
+    // No maven here : a tools { maven } block puts the real mvn before the wrapper on the PATH, see helpers.writeMavenWrapper
     tools {
-        maven 'maven-3.9.12'
         jdk 'temurin-17-jdk'
     }
 
@@ -88,6 +88,11 @@ pipeline {
             description: 'ID du Config File Provider pour le settings.xml Maven (compte de deploiement Nexus).'
         )
         string(
+            name: 'MAVEN_TOOL',
+            defaultValue: 'maven-3.9.12',
+            description: 'Nom de l\'outil Maven Jenkins, lance par le wrapper sans les tokens dans son environnement.'
+        )
+        string(
             name: 'JDK_TOOL_MAP',
             defaultValue: '8=temurin-11-jdk',
             description: 'Correspondance targetJdk -> nom de l\'outil JDK Jenkins, ex: "11=temurin-11-jdk,17=temurin-17-jdk". Sinon convention temurin-{version}-jdk. Par defaut Java 8 est bati avec le JDK 11, l\'outil temurin-8-jdk n\'existant pas.'
@@ -111,6 +116,9 @@ pipeline {
         // git asks the login and the token to this script, written by the Initialize stage from the build parameters
         GIT_ASKPASS = "${WORKSPACE}/.git-askpass.sh"
         GIT_TERMINAL_PROMPT = '0'
+        // "mvn" wrapper written by the Initialize stage : Maven runs without the tokens in its environment
+        RELEASER_BIN = "${WORKSPACE}/.releaser-bin"
+        PATH = "${WORKSPACE}/.releaser-bin:${PATH}"
     }
 
     stages {
@@ -118,6 +126,8 @@ pipeline {
         stage('Initialize') {
             steps {
                 script {
+                    // The workspace is kept between builds : a report left by a previous build must never be read as this one's
+                    sh "rm -rf '${WORKSPACE}/step-report.json' '${WORKSPACE}/verify-report.json' '${WORKSPACE}/work/logs' '${WORKSPACE}/.releaser-bin'"
                     helpers = load('platform-step-helpers.groovy')
                     helpers.stageInitialize()
                 }
@@ -175,6 +185,13 @@ pipeline {
             archiveArtifacts artifacts: 'work/logs/*.log', allowEmptyArchive: true
         }
         failure {
+            script {
+                if (helpers != null) {
+                    helpers.postFailure()
+                }
+            }
+        }
+        aborted {
             script {
                 if (helpers != null) {
                     helpers.postFailure()
