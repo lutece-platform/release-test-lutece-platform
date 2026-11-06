@@ -664,7 +664,8 @@ def declaredVersions(String workDir) {
         // A Maven failure must fail the check : an empty answer would let every SNAPSHOT, beta or RC through
         try {
             parentVersion = sh(script: "out=\$(mvn -s ${env.MAVEN_SETTINGS_XML} -N -q help:evaluate -Dexpression=project.parent.version -DforceStdout 2>/dev/null) || exit 1; printf '%s\\n' \"\$out\" | tail -1", returnStdout: true).trim()
-            declared = sh(script: "mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null", returnStdout: true)
+            // help:evaluate serializes the objects with XStream, refused by JDK 17+ without this opening
+            declared = sh(script: "MAVEN_OPTS=\"\$MAVEN_OPTS --add-opens java.base/java.util=ALL-UNNAMED\" mvn -s ${env.MAVEN_SETTINGS_XML} -q help:evaluate -Dexpression=project.dependencies -DforceStdout 2>/dev/null", returnStdout: true)
         } catch (Throwable e) {
             rethrowIfAborted(e)
             error("Maven could not read the declared versions of the POM (help:evaluate failed) : SNAPSHOT, beta and RC dependencies not checked")
