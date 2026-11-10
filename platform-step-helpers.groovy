@@ -741,8 +741,25 @@ def checkCompiles(String workDir, resource) {
 }
 
 /**
- * Releases a resource cloned in a directory in the order of the releaser workflow : everything Git first (release commit and tag pushed,
- * tag merged into the master branch for a stable version, next snapshot pushed), the Nexus deploy from the tag LAST (deployAtEnd). Any
+ * Commits the next development version on the branch checked out, nothing pushed.
+ */
+def commitNextSnapshot(String workDir, resource) {
+    setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
+    dir(workDir) {
+        sh 'git add -u'
+    }
+    checkStagedFiles(workDir, resource)
+    dir(workDir) {
+        sh """
+            git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
+        """
+    }
+}
+
+/**
+ * Releases a resource cloned in a directory in the order of the releaser workflow : everything Git first (release commit, tag and next
+ * snapshot commit pushed together by one atomic push, so that the branch is pushed once and on a SNAPSHOT version for its continuous
+ * integration, tag merged into the master branch for a stable version), the Nexus deploy from the tag LAST (deployAtEnd). Any
  * failure rolls back what this build pushed (see rollbackResource) : as nothing is in Nexus before the last command, the same version can
  * be released again. The master branch is checked before any push. The release commit is compiled
  * before any push. The resource is recorded in the report once deployed. In dry run the local part runs, compilation included, and the
@@ -768,6 +785,13 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
             error("Branch ${resource.masterBranch} not found on ${resource.scmUrl} : cannot merge ${tag} into it, release refused before any change.")
         }
         dryRunRefusals << "branch ${resource.masterBranch} not found, ${tag} could not be merged into it"
+    }
+    // Without it the branch would be pushed on the release version and fail its continuous integration
+    if (!sourceTag && !resource.nextSnapshotVersion) {
+        if (!isDryRun()) {
+            error("${coordinates(resource)} : no nextSnapshotVersion in the plan, release refused before any change.")
+        }
+        dryRunRefusals << 'no nextSnapshotVersion in the plan'
     }
     if (sourceTag) {
         if (!isAggregate) {
@@ -808,13 +832,19 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
         releaseSha = sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
     }
     checkCompiles(workDir, resource)
+    // Committed before the push : the branch reaches the remote once, on the next snapshot
+    if (!sourceTag && resource.nextSnapshotVersion) {
+        commitNextSnapshot(workDir, resource)
+    }
 
     if (isDryRun()) {
-        echo sourceTag ? "[DRY-RUN] Would push tag ${tag} only" : "[DRY-RUN] Would push ${resource.branch} and tag ${tag}"
+        echo sourceTag ? "[DRY-RUN] Would push tag ${tag} only" : "[DRY-RUN] Would push ${resource.branch} on ${resource.nextSnapshotVersion} and tag ${tag}"
         if (resource.masterBranch) {
             echo "[DRY-RUN] Would merge ${tag} into ${resource.masterBranch}"
         }
-        echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
+        if (sourceTag) {
+            echo "[DRY-RUN] Would set the next development version ${resource.nextSnapshotVersion}"
+        }
         if (sourceTag && isAggregate) {
             echo "[DRY-RUN] Would apply the version updates on ${resource.branch}"
         }
@@ -839,7 +869,7 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
                 if (sourceTag) {
                     runLogged(resource, "Push of tag ${tag}", "git push \"${authUrl}\" 'refs/tags/${tag}'")
                 } else {
-                    runLogged(resource, "Push of ${resource.branch} and tag ${tag} (atomic)", "git push --atomic \"${authUrl}\" '${resource.branch}' 'refs/tags/${tag}'")
+                    runLogged(resource, "Push of ${resource.branch} (${resource.nextSnapshotVersion}) and tag ${tag} (atomic)", "git push --atomic \"${authUrl}\" '${resource.branch}' 'refs/tags/${tag}'")
                     published.branch = sh(script: "git rev-parse 'refs/heads/${resource.branch}'", returnStdout: true).trim()
                 }
                 published.tag = true
@@ -879,18 +909,11 @@ def releaseResource(String workDir, resource, boolean isAggregate) {
                 }
             }
         }
-        if (resource.nextSnapshotVersion) {
-            setResourceVersion(workDir, resource, resource.nextSnapshotVersion)
-            dir(workDir) {
-                sh 'git add -u'
-            }
-            checkStagedFiles(workDir, resource)
+        if (sourceTag && resource.nextSnapshotVersion) {
+            commitNextSnapshot(workDir, resource)
             withRepositoryUrl(resource.scmUrl) { authUrl ->
                 dir(workDir) {
-                    runLogged(resource, "Next development version ${resource.nextSnapshotVersion}", """
-                        git diff --cached --quiet && echo 'Version already at ${resource.nextSnapshotVersion} — nothing to commit' || git commit -m "chore: prepare next development iteration ${resource.artifactId}-${resource.nextSnapshotVersion}"
-                        git push "${authUrl}" '${resource.branch}'
-                    """)
+                    runLogged(resource, "Push of ${resource.branch} on the next development version ${resource.nextSnapshotVersion}", "git push \"${authUrl}\" '${resource.branch}'")
                     published.branch = sh(script: "git rev-parse 'refs/heads/${resource.branch}'", returnStdout: true).trim()
                 }
             }
