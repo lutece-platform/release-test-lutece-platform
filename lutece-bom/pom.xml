@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/maven-v4_0_0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>fr.paris.lutece.starters</groupId>
+        <artifactId>release-test-lutece-parent</artifactId>
+        <version>8.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>release-test-lutece-bom</artifactId>
+    <version>${revision}</version>
+    <packaging>pom</packaging>
+    <name>Release test - Lutece BOM</name>
+    <description>Bill of Materials of the release test platform</description>
+
+    <properties>
+        <!-- Project version alias. Maven only interpolates revision, sha1 and
+             changelist inside a project version; any other property raises
+             "version contains an expression but should be a constant". The value
+             itself stays in the root pom, so modules can still diverge. -->
+        <revision>${lutece.release-test-lutece-bom.version}</revision>
+        <maven.deploy.skip>${bom.deploy.skip}</maven.deploy.skip>
+        <componentName>release-test-lutece-bom</componentName>
+    </properties>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>flatten-maven-plugin</artifactId>
+                <version>1.7.3</version>
+                <configuration>
+                    <updatePomFile>true</updatePomFile>
+                    <flattenMode>bom</flattenMode>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- ================================================== -->
+            <!-- Core                                               -->
+            <!-- ================================================== -->
+            <dependency>
+                <groupId>fr.paris.lutece</groupId>
+                <artifactId>lutece-core</artifactId>
+                <version>${lutece.core.version}</version>
+                <type>lutece-core</type>
+            </dependency>
+
+            <!-- ================================================== -->
+            <!-- Test components (GitHub)                           -->
+            <!-- ================================================== -->
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>plugin-releaser-test</artifactId>
+                <version>${lutece.plugin-releaser-test.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>releaser-test-redmine-component</artifactId>
+                <version>${lutece.releaser-test-redmine-component.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>releaser-test-redmine-component-buttom</artifactId>
+                <version>${lutece.releaser-test-redmine-component-buttom.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>module-testrelease</artifactId>
+                <version>${lutece.module-testrelease.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+
+            <!-- ================================================== -->
+            <!-- Test components (GitLab)                           -->
+            <!-- ================================================== -->
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>plugin-test-release-v7-v8</artifactId>
+                <version>${lutece.plugin-test-release-v7-v8.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>releaser-test-redmine-component-gitlab</artifactId>
+                <version>${lutece.releaser-test-redmine-component-gitlab.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+            <dependency>
+                <groupId>fr.paris.lutece.plugins</groupId>
+                <artifactId>plugin-testreleasegitlab</artifactId>
+                <version>${lutece.plugin-testreleasegitlab.version}</version>
+                <type>lutece-plugin</type>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+</project>
